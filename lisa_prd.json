@@ -1,0 +1,466 @@
+{
+  "lisa_prd_version": "1.0",
+  "project": {
+    "name": "gufo-performance-throughput",
+    "codename": "gufo-thunder",
+    "description": "Maximaler Total-Throughput für die Gufo Inferenz-Engine auf einem einzelnen AMD Strix Halo System durch Shared KV-Cache-Pool, Paged Attention und hybride Modell-Optimierungen",
+    "target_agent": "opencode",
+    "language": "C++20",
+    "gpu_backend": "HIP",
+    "target_hardware": {
+      "soc": "AMD Ryzen AI MAX+ 395",
+      "igpu": "Radeon 8060S",
+      "gfx_target": "gfx1151",
+      "unified_memory_gib": 128,
+      "memory_bandwidth_gbps": 273,
+      "infinity_cache_mb": 32
+    },
+    "deployment_scope": "single_node_only",
+    "explicitly_out_of_scope": ["RDMA", "multi_node", "disaggregated_prefill_decode", "semantic_caching", "kv_pruning_research"]
+  },
+
+  "optimization_objective": {
+    "primary": "aggregate_decode_throughput_tokens_per_second",
+    "secondary_diagnostic_only": ["ttft", "tpot", "p50_latency", "p99_latency"],
+    "design_principle": "Minimierung des Speicherverkehrs pro Token; jede Entscheidung muss die effektive Batch-Größe erhöhen ohne zusätzliche Bandbreite zu benötigen"
+  },
+
+  "target_models": [
+    {
+      "id": "qwen3.8-27b",
+      "type": "dense_hybrid",
+      "total_layers": 64,
+      "linear_attention_layers": 48,
+      "linear_attention_type": "gated_deltanet_gdn",
+      "full_attention_layers": 16,
+      "full_attention_type": "gqa",
+      "full_attention_config": {"q_heads": 24, "kv_heads": 4, "head_dim": 256},
+      "supports_mtp": true,
+      "mtp_speedup_factor": 1.8,
+      "mla_retrofit_available": true,
+      "mla_kv_reduction": "2x (64KiB -> 32KiB per token bf16)",
+      "fp8_kv_available": true,
+      "observed_single_decode_tps": "15-19",
+      "throughput_target_aggregate_tps": 100,
+      "observed_prefill_tps_custom_hip": 456
+    },
+    {
+      "id": "qwen3.8-flash-next",
+      "type": "moe_hybrid",
+      "total_params_b": 125,
+      "active_params_b": 6,
+      "total_layers": 48,
+      "linear_attention_layers": 36,
+      "linear_attention_type": "gated_deltanet_gdn",
+      "full_attention_layers": 12,
+      "full_attention_type": "qsa_sparse_with_indexer",
+      "supports_mtp": true,
+      "mtp_speedup_factor": 1.6,
+      "observed_single_decode_tps": "44-45",
+      "throughput_target_aggregate_tps": 150,
+      "observed_prefill_tps": "1010-1055",
+      "qsa_selected_rows_per_step": 2048
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "type": "moe_hybrid_compressed",
+      "total_layers_reusable": 37,
+      "full_attention_type": "mla_csa_hca_sliding_window",
+      "csa_compression_ratio": 4,
+      "csa_top_k": 512,
+      "hca_compression_ratio": 128,
+      "supports_speculative": true,
+      "speculative_drafter": "dspark",
+      "speculative_speedup": "+54% (15.57 -> 24.04 tps)",
+      "observed_single_decode_tps": 24,
+      "throughput_target_aggregate_tps": 80,
+      "observed_prefill_tps": "345-370"
+    }
+  ],
+
+  "features": [
+    {
+      "id": "TP-P1",
+      "name": "Continuous Batching mit maximaler Batch-Größe",
+      "priority": "P0",
+      "throughput_impact": "highest",
+      "rationale": "Auf Strix Halo ist Speicherbandbreite der Flaschenhals; Durchsatz skaliert fast linear mit Batch-Größe bis Speicher-/Compute-Grenzen greifen",
+      "requirements": [
+        "Continuous Batching muss aktiv sein",
+        "max_num_seqs muss große Werte unterstützen (Benchmark-Knee ~128 für Qwen3.8 27B)",
+        "max_num_seqs und max_num_batched_tokens müssen gemeinsam gesweept werden",
+        "Preemption-Strategie: RECOMPUTE (nicht SWAP) um Durchsatz aufrechtzuerhalten"
+      ],
+      "acceptance_criteria": [
+        "Aggregate tok/s steigt monoton mit Batch-Größe bis zum Knee",
+        "Knee-Punkt ist für jedes Zielmodell automatisiert bestimmt"
+      ]
+    },
+    {
+      "id": "TP-P2",
+      "name": "Token-Budget maximieren",
+      "priority": "P0",
+      "requirements": [
+        "max_num_batched_tokens Default deutlich über 8192",
+        "Dynamische Anpassung an verfügbaren KV-Speicher"
+      ]
+    },
+    {
+      "id": "TP-P3",
+      "name": "Speicher-Druck früh erkennen",
+      "priority": "P0",
+      "requirements": [
+        "Scheduler muss erkennen wenn Batch-Größe durch KV-Speicher limitiert wird",
+        "Preemption mit RECOMPUTE bevorzugt gegenüber SWAP"
+      ]
+    },
+    {
+      "id": "KV-P1",
+      "name": "Block-Hashing für Prefix-Cache",
+      "priority": "P0",
+      "scope": "nur_full_attention_layers",
+      "requirements": [
+        "Hash = (Block-Tokens, Parent-Hash, optionale Zusatz-Hashes)",
+        "Algorithmus konfigurierbar: xxhash Default, sha256 als sichere Option",
+        "Nur volle Blöcke werden gecacht",
+        "GDN/QSA recurrent states sind NICHT cachebar"
+      ]
+    },
+    {
+      "id": "KV-P2",
+      "name": "Copy-on-Write für geteilte KV-Blöcke",
+      "priority": "P0",
+      "scope": "nur_paged_full_attention_bloecke",
+      "requirements": [
+        "CoW zwingend für Korrektheit",
+        "GDN-States werden NICHT geteilt (siehe D1)"
+      ],
+      "testing_requirements": [
+        "Concurrency-Tests mit vielen Requests und überlappenden Präfixen",
+        "Stille Datenkorruption muss ausgeschlossen sein"
+      ]
+    },
+    {
+      "id": "KV-P3",
+      "name": "Prefix-Cache-Hit-Rate als Throughput-Metrik",
+      "priority": "P0",
+      "requirements": [
+        "Hit-Rate pro Request und global exportieren",
+        "Jeder vermiedene Full-Attention-Prefill-Block = zurückgewonnenes Token-Budget für Decode-Slots"
+      ]
+    },
+    {
+      "id": "KV-P4",
+      "name": "Cachebare-Ratio-bewusste Eviction",
+      "priority": "P1",
+      "requirements": [
+        "Cache-Manager kennt Anteil cachebarer Full-Attention-Layer pro Modell",
+        "Qwen3.8 27B: 16/64 cachebar",
+        "Qwen3.8 Flash Next: 12/48 cachebar",
+        "Eviction-Policy nach cachebarer Ratio gewichten"
+      ]
+    },
+    {
+      "id": "KV-P5",
+      "name": "Cache-Salts (optional, nicht für Single-Tenant)",
+      "priority": "P2",
+      "requirements": [
+        "Als Konfiguration vorsehen, nicht Default",
+        "Für Strix Halo Single-Tenant nicht aktiv"
+      ]
+    },
+    {
+      "id": "PA-P1",
+      "name": "HIP-native Paged-Attention-Kernel für gfx1151",
+      "priority": "P0",
+      "rationale": "Custom HIP-Kernel liefern auf gfx1151 erhebliche Gewinne die Standard-Kernel nicht erreichen",
+      "requirements": [
+        "Kein CUDA-Port, HIP-native Implementierung",
+        "Wavefront-Größe 64 (AMD)",
+        "LDS-Nutzung optimieren",
+        "Skinny-GEMM-Pfade vermeiden (kann 35x Decode-Verlust verursachen)",
+        "Kernel muss KV-Blöcke separat fetchen und multiplizieren können"
+      ],
+      "evidence": [
+        "vLLM PR #56232: Unified-Attention-2D-Pfad für gfx11 - 15/15 Zellen verbessert",
+        "vLLM PR #51511: Skinny-GEMM auf gfx1151 deaktiviert - 0.27 -> 9.54 tok/s (35.7x)"
+      ]
+    },
+    {
+      "id": "PA-P2",
+      "name": "Block-Größe als Tuning-Parameter",
+      "priority": "P1",
+      "requirements": [
+        "Konfigurierbar 16-64 Token",
+        "Benchmarking der optimalen Größe pro Zielmodell",
+        "Auf Strix Halo kann 32 besser sein als vLLM-Standard 16"
+      ]
+    },
+    {
+      "id": "PA-P3",
+      "name": "Dynamische Block-Allokation",
+      "priority": "P0",
+      "requirements": [
+        "On-Demand Allokation, keine Vorab-Reservierung für Max-Sequenzlänge",
+        "Partiell gefüllte letzte Blöcke korrekt behandeln"
+      ]
+    },
+    {
+      "id": "PA-P4",
+      "name": "Block-Sharing zwischen Requests",
+      "priority": "P0",
+      "dependencies": ["KV-P1", "KV-P2"],
+      "requirements": [
+        "Paged Attention ist Voraussetzung für effizienten Shared KV-Pool",
+        "Block-Tabelle pro Request: logisch -> physisch + Füllstand"
+      ]
+    },
+    {
+      "id": "PA-P5",
+      "name": "Wahre sparse Ausführung für QSA/CSA",
+      "priority": "P0",
+      "throughput_impact": "very_high",
+      "rationale": "Naive Implementierung überflutet 32MB MALL Infinity Cache; wahre sparse Ausführung liefert 2.5x Decode-Speedup",
+      "requirements": [
+        "Top-k-Blockauswahl der QSA/CSA-Indexer im Kernel berücksichtigen",
+        "KEINE dense laden + maskieren Strategie",
+        "Gather der ausgewählten Zeilen in zusammenhängenden Scratch-Puffer",
+        "Scratch-Puffer muss vollständig in 32MB MALL passen",
+        "Attention nur auf Working Set im MALL",
+        "DeepSeek V4: CSA (4:1, Top-512) und HCA (128:1) direkt adressieren ohne unkomprimierte Materialisierung"
+      ],
+      "evidence": [
+        "Naive QSA: Decode fällt von 24.0 auf 10.0 tok/s bei 78k Kontext",
+        "Wahre sparse QSA: 21.0-24.7 tok/s (2.5x), >50% weniger KV-Speicherbus-Traffic"
+      ]
+    },
+    {
+      "id": "CP-P1",
+      "name": "Chunked Prefill mit dynamischer Chunk-Größe",
+      "priority": "P0",
+      "rationale": "Ohne Chunked Prefill blockieren lange Prefills die gesamte Batch; auf Strix Halo kann ein 32K-Prefill 20-30s dauern",
+      "requirements": [
+        "Lange Prefills in Häppchen zerlegen",
+        "Interleaving mit Decode-Schritten",
+        "Dynamische Chunk-Größe basierend auf Token-Budget pro Iteration",
+        "Decode-Anteil pro Iteration muss hoch bleiben"
+      ]
+    },
+    {
+      "id": "KQ-P1",
+      "name": "KV-Cache-Quantisierung (FP8/INT8)",
+      "priority": "P1",
+      "rationale": "Auf bandwidth-bound System ist jedes gesparte Byte KV direkt Durchsatzgewinn",
+      "requirements": [
+        "First-class Feature, nicht nachträgliches Add-on",
+        "Paged-Attention-Kernel operiert DIREKT auf quantisierten Blöcken",
+        "Dequant on-the-fly im Kernel (kein separater Dequant-Pass)",
+        "FP8 (per-Channel) und INT8 unterstützen"
+      ],
+      "per_model": {
+        "qwen3.8-27b": "FP8 calibrated available; MLA-Retrofit halbiert KV bereits",
+        "deepseek-v4-flash": "Architektonisch bereits stark komprimiert (CSA+HCA)"
+      }
+    },
+    {
+      "id": "SD-P1",
+      "name": "Spekulative Dekodierung Default-On",
+      "priority": "P1",
+      "rationale": "Alle drei Zielmodelle bringen MTP-Heads mit; Faktor 1.6-1.8 Durchsatzgewinn",
+      "requirements": [
+        "Default-on für alle drei Zielmodelle",
+        "Draft-Forward muss dieselben paged Full-Attention-Blöcke lesen wie Target",
+        "GDN-recurrent-state muss nach akzeptiertem Token korrekt zurückgerollt werden",
+        "Batch-Größe mit und ohne Spekulation benchmarken (Draft-Overhead kann Slots verdrängen)"
+      ],
+      "per_model_evidence": {
+        "qwen3.8-27b": "15.4 tps mit MTP vs. 8.4 ohne (~1.8x)",
+        "qwen3.8-flash-next": "44-45 tps mit MTP vs. 26-28 ohne (~1.6x)",
+        "deepseek-v4-flash": "DSpark: 15.57 -> 24.04 tps (+54%)"
+      }
+    }
+  ],
+
+  "design_decisions": [
+    {
+      "id": "D1",
+      "name": "GDN-Recurrent-State-Verwaltung",
+      "decision": "Entkoppelter Slot-Pool, kein Snapshot-Pool, kein CoW",
+      "rationale": "GDN-State im KV-Block macht 96% jedes Blocks aus (23.41MB/Block) und verursacht 98% Speicherverschwendung",
+      "evidence": "ROCm/ATOM #602: 148GB alloziert, 2.9GB genutzt; Entkopplung -> 82x mehr KV-Blöcke, 4657 -> 7415 tok/s (+59%)",
+      "implementation": {
+        "state_storage": "per-Sequenz fester Puffer, dynamisch mit KV-Blöcken um Unified-Memory konkurrierend",
+        "cow": "NICHT für GDN-Slots",
+        "speculative_rollback": "ReplaySSM: Checkpoint + Ringpuffer der per-Step-Inputs (d,k,g); Rollback = Cursor-Verschiebung; periodische Materialisierung",
+        "speculative_speedup": "~1.8x vs. vLLMs Snapshot-Ansatz"
+      }
+    },
+    {
+      "id": "D2",
+      "name": "QSA/CSA-Sparsity-Ausführung",
+      "decision": "Wahre sparse Ausführung im Kernel; keine dense-laden-dann-maskieren Strategie",
+      "rationale": "Dense Laden überflutet 32MB MALL, 2.5x Durchsatzverlust bei 78k Kontext",
+      "implementation": {
+        "indexer": "bewertet jeden gepoolten Block bei jedem Schritt",
+        "gather": "nur ausgewählte Zeilen (~2048 für QSA) in zusammenhängenden Scratch-Puffer im MALL",
+        "attention": "nur auf Working Set",
+        "memory_bus_reduction": ">50%",
+        "deepseek_v4": "CSA/HCA-Blöcke direkt adressieren, keine unkomprimierte Sequenz materialisieren"
+      }
+    },
+    {
+      "id": "D3",
+      "name": "MLA-Retrofit für Qwen3.8 27B",
+      "decision": "Nativ in Gufo implementieren, Default-on für die 16 Full-Attention-Layer",
+      "rationale": "Halbierter KV-Fußabdruck -> doppelte Sequenzkapazität im selben Speicher; Durchsatz skaliert fast linear mit Batch-Größe",
+      "evidence": "MLA-Benchmarks: 1.38x bis 2.87x normalisierter Durchsatz vs. Baseline-KV bei Konkurrenz 256",
+      "implementation": {
+        "kernel_operation": "direkt auf komprimiertem MLA-Latent-State, KEINE Dekomprimierung->Attention->Rekomprimierung",
+        "kv_per_token": "32 KiB bf16 (von 64 KiB)",
+        "dependency_avoidance": "kein vLLM-Plugin, native Implementierung"
+      }
+    },
+    {
+      "id": "D4",
+      "name": "max_num_seqs-Sweep",
+      "decision": "Automatisiertes Sweep-Tool, aber gemeinsame Optimierung mit GDN-Slot-Pool und Spekulationstiefe",
+      "rationale": "max_num_seqs ist kein unabhängiger Parameter; GDN-State konkurriert um Speicher; Spekulation verändert effektive Batch-Größe",
+      "evidence": "Qwen3.8 27B: Akzeptanzlänge steigt monoton bis n=6, aber Durchsatz flacht ab; Akzeptanzlänge allein ist kein geeigneter Indikator",
+      "implementation": {
+        "dimensions": ["max_num_seqs", "num_speculative_tokens", "gdN_slot_size", "block_granularity_full_attention"],
+        "objective": "Aggregate Total Token Throughput (Input + Output)",
+        "not_objective": "Output-Tokens allein"
+      }
+    }
+  ],
+
+  "metrics": {
+    "primary": {
+      "name": "aggregate_decode_throughput_tps",
+      "description": "Summe der Decode-tok/s über alle gleichzeitigen Requests bei maximaler speicherzulässiger Batch-Größe",
+      "measured_per_model": true
+    },
+    "secondary_diagnostic": [
+      {"name": "effective_batch_size", "description": "Anzahl gleichzeitig aktiver Sequenzen"},
+      {"name": "kv_memory_utilization", "description": "belegte Blöcke / Gesamtblöcke"},
+      {"name": "prefix_cache_hit_rate", "description": "nur Full-Attention-Blöcke"},
+      {"name": "prefill_vs_decode_time_ratio", "description": "pro Iteration"},
+      {"name": "mtp_acceptance_rate", "description": "bestimmt Netto-Durchsatzeffekt der Spekulation"},
+      {"name": "gdn_slot_memory_usage", "description": "Konkurrenz mit KV-Blöcken um Unified Memory"}
+    ]
+  },
+
+  "acceptance_gates": [
+    {
+      "gate": "kernel_benchmark",
+      "description": "Kein Feature gilt als fertig bevor es auf gfx1151 mit allen drei Zielmodellen gemessen wurde",
+      "required": true
+    },
+    {
+      "gate": "aggregate_throughput",
+      "description": "Mindest-Schwellen pro Modell erreicht",
+      "targets": {
+        "qwen3.8-27b": ">100 tok/s aggregate",
+        "qwen3.8-flash-next": ">150 tok/s aggregate",
+        "deepseek-v4-flash": ">80 tok/s aggregate"
+      }
+    },
+    {
+      "gate": "correctness",
+      "description": "Concurrency-Tests mit überlappenden Präfixen und Spekulation müssen stille Datenkorruption ausschließen"
+    }
+  ],
+
+  "testing_requirements": [
+    "Concurrency-Tests mit vielen gleichzeitigen Requests und überlappenden Präfixen (CoW-Korrektheit)",
+    "Spekulations-Rollback-Tests für GDN-State (ReplaySSM-Korrektheit)",
+    "Prefix-Cache-Hit-Rate-Validierung gegen Referenz",
+    "QSA/CSA-Sparsity-Korrektheit (Top-k-Auswahl vs. Referenz)",
+    "MLA-Retrofit-Genauigkeit (Retrofit vs. Original)",
+    "End-to-End-Throughput-Benchmarks für alle drei Zielmodelle auf gfx1151",
+    "Stress-Tests: maximale Batch-Größe über lange Zeit, Speicher-Druck-Szenarien"
+  ],
+
+  "implementation_phases": [
+    {
+      "phase": 1,
+      "name": "Foundation",
+      "items": ["TP-P1", "TP-P2", "TP-P3", "CP-P1"],
+      "rationale": "Continuous Batching + Chunked Prefill sind Voraussetzung für jede weitere Optimierung"
+    },
+    {
+      "phase": 2,
+      "name": "KV-Management",
+      "items": ["PA-P1", "PA-P3", "PA-P4", "KV-P1", "KV-P2", "KV-P3", "D1"],
+      "rationale": "Paged Attention + Shared KV + GDN-Entkopplung als Kern-Infrastruktur"
+    },
+    {
+      "phase": 3,
+      "name": "Model-Specific Optimizations",
+      "items": ["PA-P5", "D2", "D3", "KQ-P1"],
+      "rationale": "Sparse Kernel, MLA-Retrofit und KV-Quantisierung heben die Batch-Größe weiter"
+    },
+    {
+      "phase": 4,
+      "name": "Speculative Decoding",
+      "items": ["SD-P1", "D1-replaySSM"],
+      "rationale": "MTP-Integration mit korrektem GDN-Rollback"
+    },
+    {
+      "phase": 5,
+      "name": "Tuning",
+      "items": ["PA-P2", "KV-P4", "D4"],
+      "rationale": "Automatisierte Parameter-Optimierung auf dem fertigen Stack"
+    }
+  ],
+
+  "risks": [
+    {
+      "id": "R1",
+      "description": "HIP-Kernel-Performance hinter CUDA-Erwartung",
+      "mitigation": "Explizites Kernel-Benchmark-Gate pro Feature; gfx1151-spezifisches Tuning von Anfang an"
+    },
+    {
+      "id": "R2",
+      "description": "CoW-Komplexität führt zu stiller Datenkorruption",
+      "mitigation": "Concurrency-Tests als Pflicht-Gate"
+    },
+    {
+      "id": "R3",
+      "description": "Unified-Memory-Bandbreitenkonflikte mit Modellgewichten",
+      "mitigation": "GDN-Entkopplung (D1) reduziert Speicher-Druck; KV-Quantisierung (KQ-P1) reduziert Bandbreitenbedarf"
+    },
+    {
+      "id": "R4",
+      "description": "Spekulations-Overhead verdrängt Decode-Slots bei großer Batch",
+      "mitigation": "D4-Sweep optimiert Spekulationstiefe gemeinsam mit Batch-Größe"
+    },
+    {
+      "id": "R5",
+      "description": "QSA/CSA-Indexer-Kosten skalieren mit Kontextlänge",
+      "mitigation": "Indexer muss im Kernel effizient sein; ggf. gepoolte Blöcke cachen"
+    }
+  ],
+
+  "references": {
+    "vllm": [
+      "PagedAttention (Kwon et al.)",
+      "Automatic Prefix Caching",
+      "Chunked Prefill Scheduling (V1)",
+      "vLLM PR #56232 (gfx11 Unified-Attention tuning)",
+      "vLLM PR #51511 (Skinny-GEMM deaktiviert)"
+    ],
+    "rocm_atom": [
+      "ROCm/ATOM #602 (GDN-State-Entkopplung)"
+    ],
+    "research": [
+      "ReplaySSM (speculative decoding with recurrent states)",
+      "Qwen3.8 27B MLA-Retrofit (training-free, qwen-mla-vllm)"
+    ],
+    "strix_halo_benchmarks": [
+      "Qwen3.8 27B: ~15-19 tok/s single, 456 tok/s prefill (custom HIP)",
+      "Qwen3.8 Flash Next: ~44-45 tok/s single, 1010-1055 tok/s prefill",
+      "DeepSeek V4 Flash: ~24 tok/s single mit DSpark, 345-370 tok/s prefill"
+    ]
+  }
+}
