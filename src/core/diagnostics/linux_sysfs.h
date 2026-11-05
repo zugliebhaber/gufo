@@ -63,6 +63,15 @@ private:
   std::filesystem::path proc_root_;
 };
 
+/// The dpm performance level the driver currently enforces on the first DRM
+/// card (`auto`, `high`, `low`, ...), or empty when sysfs exposes none. Reads
+/// sysfs only, so a startup banner or a diagnostic can report the profile
+/// before HIP opens the device: a measurement taken at `auto` includes the
+/// driver's ramp-up and any compositor work sharing the iGPU, while `high`
+/// pins the clocks for the whole run.
+[[nodiscard]] std::string ReadPowerProfile(
+    const std::filesystem::path& sys_root = "/sys");
+
 }  // namespace gufo::diagnostics
 
 #endif  // GUFO_CORE_DIAGNOSTICS_LINUX_SYSFS_H_

@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/core/diagnostics/linux_sysfs.h"
 #include "src/core/platform/os_info.hpp"
 
 namespace {
@@ -68,6 +69,48 @@ using gufo::diagnostics::PlanQueues;
 using gufo::diagnostics::QueryQueueCensus;
 using gufo::diagnostics::QueueCensus;
 using gufo::diagnostics::QueueProfile;
+
+/// Mirrors `/sys/class/drm`: a card directory with the dpm level plus connector
+/// entries (`card1-DP-1`, ...) that share the `card` prefix and must be skipped.
+class FakeDrm {
+public:
+  FakeDrm()
+      : root_(std::filesystem::temp_directory_path() /
+              ("gufo-power-" + std::to_string(gufo::platform::ProcessId()))) {
+    std::filesystem::remove_all(root_);
+  }
+
+  ~FakeDrm() { std::filesystem::remove_all(root_); }
+
+  FakeDrm(const FakeDrm&) = delete;
+  FakeDrm& operator=(const FakeDrm&) = delete;
+
+  void AddCard(std::string_view name, std::string_view level) {
+    const auto device = root_ / "class" / "drm" / name / "device";
+    std::filesystem::create_directories(device);
+    std::ofstream file(device / "power_dpm_force_performance_level");
+    file << level << '\n';
+  }
+
+  [[nodiscard]] const std::filesystem::path& sys_root() const { return root_; }
+
+private:
+  std::filesystem::path root_;
+};
+
+void PowerProfileReadsTheCardLevel() {
+  FakeDrm drm;
+  drm.AddCard("card1-DP-1", "auto");
+  drm.AddCard("card1", "high");
+  const auto profile = gufo::diagnostics::ReadPowerProfile(drm.sys_root());
+  Expect(profile == "high", "the card directory wins over its connectors");
+}
+
+void PowerProfileIsEmptyWithoutDrm() {
+  FakeDrm drm;
+  const auto profile = gufo::diagnostics::ReadPowerProfile(drm.sys_root());
+  Expect(profile.empty(), "no DRM tree reports no profile");
+}
 
 void CensusCountsComputeQueuesAcrossProcesses() {
   FakeKfd kfd;
@@ -240,6 +283,8 @@ void OperatorPlanDoesNotPredictAQueueCount() {
 }  // namespace
 
 int main() {
+  PowerProfileReadsTheCardLevel();
+  PowerProfileIsEmptyWithoutDrm();
   CensusCountsComputeQueuesAcrossProcesses();
   CensusIsEmptyWithoutKfd();
   ProfilesPickTheirMeasuredCap();

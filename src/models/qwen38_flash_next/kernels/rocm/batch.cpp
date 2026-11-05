@@ -44,32 +44,6 @@ const float* InjectWeights(const DeviceMixer& m) {
              : nullptr;
 }
 
-/// Debug-only per-layer residual fingerprint for the prefill cohort
-/// (`GUFO_LAYER_TRACE=1`), matching the serial path's trace.
-void TraceCohortRow(const char* tag, std::uint32_t layer, const float* row,
-                    std::uint32_t count, hipStream_t stream) {
-  static const bool enabled = std::getenv("GUFO_LAYER_TRACE") != nullptr;
-  if (!enabled) {
-    return;
-  }
-  std::vector<float> host(count);
-  if (hipStreamSynchronize(stream) != hipSuccess ||
-      hipMemcpy(host.data(), row, std::size_t{count} * sizeof(float),
-                hipMemcpyDeviceToHost) != hipSuccess) {
-    std::fprintf(stderr, "[trace] %s layer=%u copy failed\n", tag, layer);
-    return;
-  }
-  double sum = 0.0;
-  double sumsq = 0.0;
-  for (const float value : host) {
-    sum += value;
-    sumsq += static_cast<double>(value) * value;
-  }
-  std::fprintf(stderr,
-               "[trace] %s layer=%u sum=%.6f sumsq=%.6f first=%.6f last=%.6f\n",
-               tag, layer, sum, sumsq, host.front(), host.back());
-}
-
 // A cancelled row stops touching its private state. Shared projections retain
 // their row layout so cancellation cannot change a peer's arithmetic/order.
 template<class Item>
@@ -1371,11 +1345,6 @@ bool Executor::ForwardPrefillBatch(std::span<const PrefillItem> items,
       if (!HcMix(l.hc_attn, base.res, false, base.mixed, base.inject, rows,
                  error))
         return false;
-      TraceCohortRow("cohort-mix", il,
-                     base.mixed + (std::size_t{offsets[0]} +
-                                   items[0].tokens.size() - 1) *
-                                      c.hidden_size,
-                     c.hidden_size, stream_);
       // Each session runs the single-session prefill form of its attention or
       // recurrent layer, including that layer's own projections and output.
       for (std::size_t i = 0; i < items.size(); ++i) {
@@ -1409,14 +1378,10 @@ bool Executor::ForwardPrefillBatch(std::span<const PrefillItem> items,
         }
       }
       s_ = base;
-      TraceCohortRow("cohort-attn", il,
-                     base.block_out + (std::size_t{offsets[0]} +
-                                       items[0].tokens.size() - 1) *
-                                          c.hidden_size,
-                     c.hidden_size, stream_);
       defer_residual_ = WmmaExperts(l, rows);
       Combine(base.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn));
-      if (!HcMix(l.hc_ffn, base.res, false, base.mixed, base.inject, rows, error) ||
+      if (!HcMix(l.hc_ffn, base.res, false, base.mixed, base.inject, rows,
+                 error) ||
           !Moe(l, base.mixed, base.block_out, rows, error))
         return false;
       const float* next_norm =
@@ -1429,11 +1394,6 @@ bool Executor::ForwardPrefillBatch(std::span<const PrefillItem> items,
                                      : nullptr;
       s_ = base;
       Combine(base.res, next_norm, rows, next_inject);
-      TraceCohortRow("cohort", il,
-                     base.res + (std::size_t{offsets[0]} +
-                                 items[0].tokens.size() - 1) *
-                                    c.HcDim(),
-                     c.HcDim(), stream_);
     }
     // One gathered last row per item: the head only ever needs each
     // session's frontier. The head runs the single-session decode arithmetic

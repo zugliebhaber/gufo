@@ -249,6 +249,32 @@ written to the artifact. `gufo bench` remains the direct model-path
 microbenchmark; use this serving harness for TTFT, ITL, queueing, and
 concurrency decisions.
 
+#### Cold canonical table vs reuse workloads
+
+The canonical serving table is a **cold, unique-prompt** measurement: every
+request gets a unique front-loaded nonce and the server runs with
+`--cache-ram-bytes off`. That is the right control for prefill and decode
+kernel work, but it cannot show cache or coalescing gains.
+
+Measure reuse separately:
+
+- **Shared-prefix cache:** run with `--shared-prefix` and the RAM cache at
+  auto; report output tok/s, TTFT and wall time. Cached prefill is logged as
+  `prefill_tokens=0`, so a physical-token sum can decrease while the user-facing
+  rate improves. A c32 shared-prefix run measured 94.67 -> 119.94 output tok/s
+  (+26.7%) and 13.87 -> 0.223 s TTFT.
+- **Request coalescing:** run `GUFO_REQUEST_COALESCE=1` on byte-identical
+  greedy requests; followers have no KV and log `prefill_tokens=0`. A
+  32-identical batch measured 44.410 -> 4.891 s (9.08x) and 4096 identical
+  output tokens. The canonical unique-nonce table on/off difference was
+  +0.43% to +0.91% (noise; no group forms).
+
+The fresh 8/16/24/32 table and both A/Bs are in
+[the Flash-Next benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md) and
+[N-LEVERS](models/qwen3.8-flash-next/N-LEVERS.md). The design rationale is in
+[ADR-4](ARCHITECTURE.md#adr-4-keep-cold-and-shared-prefix-measurements-separate)
+and [ADR-5](ARCHITECTURE.md#adr-5-coalescing-only-for-exact-duplicate-greedy-streams).
+
 ### Kernel resource check
 
 The check reads the code objects in a binary. It does not use a GPU. Run it

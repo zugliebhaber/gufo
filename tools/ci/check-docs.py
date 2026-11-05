@@ -22,6 +22,8 @@ REQUIRED_DOC_FILES = [
     "NOTICE",
     "THIRD_PARTY_NOTICES.md",
     "AGENTS.md",
+    "docs/README.md",
+    "docs/ARCHITECTURE.md",
     "docs/CLI.md",
     "docs/DEVELOPMENT.md",
     "docs/RELEASING.md",
@@ -155,6 +157,31 @@ def check_json_blocks(md_file: Path, content: str) -> List[str]:
     return errors
 
 
+MERMAID_KINDS = (
+    "flowchart", "graph ", "sequenceDiagram", "stateDiagram", "classDiagram",
+    "erDiagram", "journey", "gantt", "pie", "mindmap",
+)
+
+
+def check_mermaid_blocks(md_file: Path, content: str) -> List[str]:
+    """Validate that every Mermaid fence is non-empty and has a known kind."""
+    errors: List[str] = []
+    for match in FENCED_BLOCK_REGEX.finditer(content):
+        if (match.group("lang") or "").lower() != "mermaid":
+            continue
+        code = match.group("code").strip()
+        line_no = content[: match.start()].count("\n") + 1
+        if not code:
+            errors.append(f"{md_file}:{line_no}: Empty Mermaid block")
+            continue
+        first = code.splitlines()[0].strip()
+        if not first.startswith(MERMAID_KINDS):
+            errors.append(
+                f"{md_file}:{line_no}: Unknown Mermaid diagram kind '{first[:40]}'"
+            )
+    return errors
+
+
 def check_links_and_anchors(repo_root: Path, md_files: List[Path]) -> Tuple[int, List[str]]:
     """Validate local links and anchor targets across markdown files."""
     errors: List[str] = []
@@ -252,6 +279,15 @@ def main() -> int:
     links_count, link_errors = check_links_and_anchors(repo_root, md_files)
     all_errors.extend(link_errors)
 
+    mermaid_count = 0
+    for md_file in md_files:
+        try:
+            content = md_file.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        mermaid_count += content.count("```mermaid")
+        all_errors.extend(check_mermaid_blocks(md_file, content))
+
     if all_errors:
         print(f"\n[check-docs] FAILED: Found {len(all_errors)} documentation errors:")
         for err in all_errors:
@@ -259,8 +295,9 @@ def main() -> int:
         return 1
 
     print(
-        f"[check-docs] PASSED: {len(md_files)} markdown files and {links_count} local links/anchors "
-        f"verified with zero broken links or invalid JSON blocks."
+        f"[check-docs] PASSED: {len(md_files)} markdown files, {links_count} local links/anchors "
+        f"and {mermaid_count} Mermaid blocks verified with zero broken links, "
+        f"invalid JSON blocks or malformed diagrams."
     )
     return 0
 

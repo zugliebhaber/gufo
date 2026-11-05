@@ -1,5 +1,7 @@
 # KV Cache
 
+> See the [architecture](ARCHITECTURE.md), [cache redesign RFC](cache-redesign/RFC.md) and [server contract](SERVER.md).
+
 ## What "KV cache" means here
 
 Two different things share the name. Keeping them apart avoids most of the

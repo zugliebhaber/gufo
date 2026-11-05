@@ -1,5 +1,7 @@
 # Qwen-Image-2.1
 
+> Part of the [model index](../README.md); see the [architecture](../../ARCHITECTURE.md), [CLI](../../CLI.md) and [README quickstart](../../../README.md#quickstart).
+
 [Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [ROCm migration](ROCM.md)
 
 Native HIP image generation and editing on AMD Strix Halo (`gfx1151`). Loads

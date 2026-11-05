@@ -1,5 +1,7 @@
 # Testing
 
+> See the [documentation index](README.md), [development guide](DEVELOPMENT.md), [CI](CI.md) and [architecture](ARCHITECTURE.md).
+
 Run the smallest check that covers the change. Correctness and model-owned
 quality limits pass before performance results count. Production targets
 Linux gfx1151. CMake/CTest work with either system dependencies or `nix develop`.

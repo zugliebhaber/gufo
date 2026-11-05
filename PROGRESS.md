@@ -1563,3 +1563,64 @@ Cosinus 0,9996, Speed 1,6–3,1× langsamer → keine Produktionsübernahme).
 
 
 
+## Nachtrag: Batch-Prefill-Kohorte, Watchdog und Concurrency-Kurve (03.11.2026)
+
+**Batch-Breite.** Flash-Next führt Decode-Wellen bis **32 Zeilen** aus
+(`kMaxBatchSessions`, `SupportedPlans` 2…32); 27B und DeepSeek bleiben bei acht.
+Die gemessene Breiten-Kurve (336-Token-Prompts, ctx 1024): total 231,61 /
+277,14 / 294,00 / 305,19 tok/s bei Breite 8/16/24/32, Decode-Phase 85,87 /
+108,34 / 117,33 / 125,10 tok/s. Marginal +19,7 / +6,1 / +3,8 %; Breite 24
+liefert 96,3 % des Width-32-Totals bei +22 % Request-TG und −25 % TTFT.
+
+**Batched Prefill.** `Executor::ForwardPrefillBatch` + `Model::PrefillBatch` +
+Scheduler-Paarung tragen zwei kalte Prompts in einem Pass. Zwei echte
+State-Fehler wurden behoben: (1) der Wechsel auf per-Session-Zeilenviews
+(`UseScratch(RowScratch(...))`) löschte `xn_half_` und damit die vom breiten
+`Combine` gestagte Norm — `HcMix` las eine veraltete F32-Norm; (2) derselbe
+Wechsel löschte `moe_pending_`, sodass der MoE-Epilogue aus dem Residual fiel.
+Beide Pfade rechnen jetzt den vollen F32-Mix (die fusionierte F16-Staging ist
+nicht über Zeilenviews teilbar). Der Default blieb dabei bit-identisch
+(189f9e81 / b9dc0063 / 56d2de5c / 3d03cf8b) und durchsatzneutral. Gemessener
+Kohorten-Pass: 2×702 Tokens in 1157/1077 ms = 1213/1303 tok/s gegen 945 tok/s
+des seriellen Modells (+28…38 % PP). Der Pfad bleibt **opt-in**
+(`GUFO_BATCHED_PREFILL=1`), weil die Kohorte nicht bit-identisch ist: die
+zeilenweise gebatchten GEMMs tilelen mit der Zeilenzahl anders (Layer-0-Mixer
+`sumsq` 921 seriell vs 1150 Kohorte), wodurch Greedy-Tokens ab Layer 0
+divergieren.
+
+**Prefill-Kostenmodell.** `pass(t) ≈ 0,285 s + t/1450` (ctx 2048; `0,275 s +
+t/1501` bei ctx 1024). Die Fixkosten sind ein vollständiger Expert-Sweep
+(66 GB bei 240,76 GB/s); bei 336 Tokens sind das 55 % des Passes. Bei gleicher
+Wandzeit verarbeitet eine 2×702-Kohorte 1404 Tokens (1157 ms), ein einzelner
+1248-Token-Pass 1248 Tokens (1146 ms) — die kürzere Attention pro Session
+bringt zusätzlich ~8–11 %.
+
+**Concurrency-Kurve 1…32** (gleiche Binary, ctx 1024, 336-Token-Prompts,
+cache off): req PP 643,86/639,19/660,18/669,61/671,78/666,35; req TG
+28,34/22,12/16,42/11,57/7,29/4,33; agg TG 25,35/37,15/51,30/66,10/76,44/83,54;
+agg total 92,29/134,97/185,57/239,10/277,90/301,33 (+46,3/+37,5/+28,9/+16,2/
++8,4 %); Prefill-Anteil 10,4→32,7 %; Decode-Phase 28,29→124,10; TTFT
+0,53→16,07 s. Prefill ist nebenläufigkeits-invariant, weil ein Pass gleichzeitig
+läuft — genau deshalb steigen die Prefill-Hebel (Kohorte, Overlap) mit der
+Breite.
+
+**Watchdog.** `--stall-timeout-ms` existierte, war aber per Default **0
+(aus)**; deshalb blieb ein Lauf mit 121 empfangenen / 97 abgeschlossenen
+Requests stumm stehen. Default ist jetzt **180000 ms** (längstes legitimes
+Fortschritts-Loch ist ein Prefill-Chunk, ~3 s); ein echter Hänger wird als
+`device_lost` gemeldet statt unbegrenzt zu warten.
+
+**Doku.** `docs/SERVER.md` (Batch-Breite pro Modell, Prefill-Pass-Kosten,
+Stall-Default, opt-in-Kohorte), `docs/CLI.md` (`stallTimeoutMs`-Default,
+Sessions-Wellen), `docs/models/qwen3.8-flash-next/README.md` (neuer Abschnitt
+„Batching, widths and limits"), `docs/models/qwen3.8-flash-next/BENCHMARKS.md`
+(Abschnitt „Batch scaling (November 2026)") und
+`artifacts/serving/batch-pp-tg-levers.md` (Abschnitte 13.4, 13.6, 13.7,
+Build-Umgebung). Analyse und Rohdaten:
+`artifacts/serving/pp-tg-concurrency-1-32-ctx1024*.json`,
+`batch-levers-width-curve-ctx1024*.json`, `prefill-c1-r*-ctx2048.json`.
+
+**Offen:** `GUFO_BATCHED_PREFILL` ist nicht bit-identisch (M-invariante
+zeilenweise GEMMs nötig); Prefill/Decode-Overlap (Dual-Lane) und die
+Kernel-Hebel A3/N2/N3 sind nicht implementiert; die Details stehen in
+`artifacts/serving/batch-pp-tg-levers.md` Abschnitt 13.7.

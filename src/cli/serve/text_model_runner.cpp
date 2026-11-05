@@ -233,19 +233,33 @@ struct ValidatedRunner {
   std::size_t snapshot_max_bytes{0};
 };
 
-std::optional<std::size_t> PerStateReservationBytes(
-    const TextRunnerResourceClaim& resources) {
+/// Bytes the whole session pool needs on the device.
+///
+/// Both terms are replicated once per state: the dense adapter creates one
+/// `QwenGpuExecutor` per slot (`ContinuationAdapter::CreateSlot`), and each
+/// executor owns its own `QwenGpuArena` and stream, so the temporary scratch is
+/// paid per session too. A runner that shares one scratch set across states
+/// reports zero scratch here instead — which is what the Flash-Next claim does,
+/// because its runtime scratch is allocated once at model load. Charging the
+/// scratch only once while the states each allocate their own would under-reserve
+/// by (states - 1) scratch sets and let the pool overcommit device memory.
+std::optional<std::size_t> AggregateReservationBytes(
+    const TextRunnerResourceClaim& resources, std::size_t state_count) {
   if (!resources.per_request_state_bytes.has_value() ||
       !resources.temporary_scratch_bytes.has_value()) {
     return std::nullopt;
   }
-  if (*resources.per_request_state_bytes >
-      std::numeric_limits<std::size_t>::max() -
-          *resources.temporary_scratch_bytes) {
+  const std::size_t per_state = *resources.per_request_state_bytes;
+  const std::size_t scratch = *resources.temporary_scratch_bytes;
+  if (per_state > std::numeric_limits<std::size_t>::max() - scratch) {
     throw std::invalid_argument("text runner resource claim overflows");
   }
-  return *resources.per_request_state_bytes +
-         *resources.temporary_scratch_bytes;
+  const std::size_t per_state_total = per_state + scratch;
+  if (per_state_total != 0 &&
+      state_count > std::numeric_limits<std::size_t>::max() / per_state_total) {
+    throw std::invalid_argument("text runner aggregate claim overflows");
+  }
+  return per_state_total * state_count;
 }
 
 ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
@@ -288,15 +302,13 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
   }
 
   auto resources = runner->ResourceClaim();
-  const auto per_state_reservation = PerStateReservationBytes(resources);
+  const auto aggregate_reservation =
+      AggregateReservationBytes(resources, state_count);
   if (resources.state_capacity_bytes.has_value() &&
-      per_state_reservation.has_value()) {
-    const std::size_t per_request = *per_state_reservation;
-    const std::size_t capacity = *resources.state_capacity_bytes;
-    if (per_request != 0 && state_count > capacity / per_request) {
-      throw std::invalid_argument(
-          "text runner request-state claim exceeds state capacity");
-    }
+      aggregate_reservation.has_value() &&
+      *aggregate_reservation > *resources.state_capacity_bytes) {
+    throw std::invalid_argument(
+        "text runner request-state claim exceeds state capacity");
   }
 
   auto plans = runner->SupportedPlans();
@@ -1704,29 +1716,47 @@ bool TextRunnerPool::Request::CanBatchPrefill() const {
 }
 
 std::vector<TextPrefillStep> TextRunnerPool::Request::PrefillBatch(
-    Request& peer, std::size_t max_input_tokens) {
-  if (!CanBatchPrefill() || !peer.CanBatchPrefill()) {
+    std::span<Request* const> peers, std::size_t max_input_tokens) {
+  if (!CanBatchPrefill()) {
     throw std::logic_error("request is not eligible for a batched prefill");
   }
-  auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
-  auto& peer_state = dynamic_cast<TextRunnerState&>(peer.impl_->lease.state());
+  for (Request* peer : peers) {
+    if (peer == nullptr || !peer->CanBatchPrefill()) {
+      throw std::logic_error("peer is not eligible for a batched prefill");
+    }
+  }
+  // Prepare every lease before the pass, as the single-request path does: the
+  // hook reserves the prefill scratch for the tokens this chunk will consume.
   impl_->lease.PreparePrefill(
       std::min(impl_->prompt.size() - impl_->prefill_offset, max_input_tokens));
-  peer.impl_->lease.PreparePrefill(
-      std::min(peer.impl_->prompt.size() - peer.impl_->prefill_offset,
-               max_input_tokens));
-  std::array<TextPrefillBatchItem, 2> items{{
-      {&state, std::span<const TextRunnerToken>(impl_->prompt),
-       impl_->prefill_offset, max_input_tokens},
-      {&peer_state, std::span<const TextRunnerToken>(peer.impl_->prompt),
-       peer.impl_->prefill_offset, max_input_tokens},
-  }};
+  for (Request* peer : peers) {
+    peer->impl_->lease.PreparePrefill(std::min(
+        peer->impl_->prompt.size() - peer->impl_->prefill_offset,
+        max_input_tokens));
+  }
+  // The runner pass carries this request first, then its peers in order.
+  std::vector<TextPrefillBatchItem> items;
+  items.reserve(peers.size() + 1);
+  items.push_back({
+      &dynamic_cast<TextRunnerState&>(impl_->lease.state()),
+      std::span<const TextRunnerToken>(impl_->prompt),
+      impl_->prefill_offset,
+      max_input_tokens,
+  });
+  for (Request* peer : peers) {
+    items.push_back({
+        &dynamic_cast<TextRunnerState&>(peer->impl_->lease.state()),
+        std::span<const TextRunnerToken>(peer->impl_->prompt),
+        peer->impl_->prefill_offset,
+        max_input_tokens,
+    });
+  }
   auto steps = impl_->runner->PrefillBatch(items);
   if (steps.size() != items.size()) {
     throw std::runtime_error("text runner returned an invalid batched prefill");
   }
   for (std::size_t i = 0; i < items.size(); ++i) {
-    auto& target = i == 0 ? *impl_ : *peer.impl_;
+    Impl& target = i == 0 ? *impl_ : *peers[i - 1]->impl_;
     const auto remaining = target.prompt.size() - target.prefill_offset;
     if (steps[i].interrupted || steps[i].consumed_tokens == 0 ||
         steps[i].consumed_tokens > std::min(remaining, max_input_tokens)) {

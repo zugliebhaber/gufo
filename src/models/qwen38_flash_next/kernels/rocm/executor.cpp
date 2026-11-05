@@ -43,33 +43,6 @@ bool Check(hipError_t err, const char* what, std::string* error_msg) {
   return false;
 }
 
-/// Debug-only per-layer residual fingerprint (`GUFO_LAYER_TRACE=1`). Compares
-/// the last row of the residual after every layer between the serial and the
-/// batched prefill path.
-void TraceResidual(const char* tag, std::uint32_t layer, const float* row,
-                   std::uint32_t count, hipStream_t stream) {
-  static const bool enabled = std::getenv("GUFO_LAYER_TRACE") != nullptr;
-  if (!enabled) {
-    return;
-  }
-  std::vector<float> host(count);
-  if (hipStreamSynchronize(stream) != hipSuccess ||
-      hipMemcpy(host.data(), row, std::size_t{count} * sizeof(float),
-                hipMemcpyDeviceToHost) != hipSuccess) {
-    std::fprintf(stderr, "[trace] %s layer=%u copy failed\n", tag, layer);
-    return;
-  }
-  double sum = 0.0;
-  double sumsq = 0.0;
-  for (const float value : host) {
-    sum += value;
-    sumsq += static_cast<double>(value) * value;
-  }
-  std::fprintf(stderr,
-               "[trace] %s layer=%u sum=%.6f sumsq=%.6f first=%.6f last=%.6f\n",
-               tag, layer, sum, sumsq, host.front(), host.back());
-}
-
 /// Allocates `count` elements of T and records the allocation.
 template<typename T>
 T* Alloc(std::vector<void*>& allocations, std::size_t count,
@@ -145,6 +118,11 @@ constexpr std::uint32_t kRoutedTileRowsNarrow = 16;
 constexpr std::uint32_t kRoutedTileRowsWide = 48;
 
 std::uint32_t RoutedTileRows(std::size_t slots, const Config& c) {
+  // Switch to the wide tile at 16 experts' worth of slots. Measured on the
+  // 3-4 request prefill cohort (20-26 rows per expert in a 48-row tile, 45%
+  // utilisation) a higher threshold gained only +0.8% total, inside the 1-2%
+  // run-to-run noise, so the wide tile's better weight reuse already pays for
+  // the padding. Keep the original switch.
   return slots >= static_cast<std::size_t>(16) * c.num_experts
              ? kRoutedTileRowsWide
              : kRoutedTileRowsNarrow;
@@ -3462,20 +3440,13 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
     // Both stacked SSM projections consume the same F16 input. Avoid writing
     // unused F32/Q8 copies when the wide mixer can supply that input directly.
-    static const bool trace_no_half =
-        std::getenv("GUFO_TRACE_NO_HALF") != nullptr;
-    const bool half_only = !trace_no_half && WidePrefill(n) &&
-                           n <= options_.max_batch && l.linear &&
-                           DenseF16Route(l.ssm_in, n) &&
-                           l.ssm_alpha_beta.type == GgmlType::kF16 &&
-                           l.ssm_alpha_beta.cols == l.ssm_in.cols;
-    if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
-               half_only)) {
+    // The fused staging below only helps a single-session pass. A batched
+    // prefill switches to per-session row views, which must drop that staging,
+    // so both paths compute the full F32 mix instead: same kernels, same rows,
+    // same result, and the cohort no longer differs from the serial pass.
+    if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg)) {
       return false;
     }
-    TraceResidual("serial-mix", il,
-                  s_.mixed + std::size_t{n - 1} * c.hidden_size, c.hidden_size,
-                  stream_);
     // The last target layer's query outputs have no later cache consumer.
     // Preserve all K/V/indexer rows and the final query's original tile.
     const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
@@ -3500,9 +3471,6 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return false;
     }
 
-    TraceResidual("serial-attn", il,
-                  s_.block_out + std::size_t{n - 1} * c.hidden_size,
-                  c.hidden_size, stream_);
     const float* next_norm =
         il + 1 < c.num_layers
             ? (c.IsPleLayer(il + 1) ? nullptr
@@ -3523,14 +3491,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       defer_residual_ = WmmaExperts(l, rows);
       // The wide FFN reads the mix only through its F16 rows (router, routed
       // experts) and tiled Q8 rows (shared expert).
-      const bool no_f32 = !trace_no_half && prefill_phase && defer_residual_ &&
-                          rows <= options_.max_batch &&
-                          l.router.type == GgmlType::kF16 &&
-                          l.shexp_gate.type == GgmlType::kQ8_0 &&
-                          l.shexp_up.type == GgmlType::kQ8_0;
       Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn));
-      if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
-                 false, no_f32) ||
+      if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows,
+                 error_msg) ||
           !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
         return false;
       Combine(s_.res, next_norm, rows, next_inject);
@@ -3551,8 +3514,6 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     } else if (!finish(n)) {
       return false;
     }
-    TraceResidual("serial", il,
-                  s_.res + std::size_t{n - 1} * c.HcDim(), c.HcDim(), stream_);
     normed = next_norm != nullptr;
   }
   if (end_layer < c.num_layers) {

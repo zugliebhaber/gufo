@@ -1,5 +1,7 @@
 # Qwen3-ASR 1.7B
 
+> Part of the [model index](../README.md); see the [architecture](../../ARCHITECTURE.md), [CLI](../../CLI.md) and [README quickstart](../../../README.md#quickstart).
+
 Native BF16 safetensors speech recognition on gfx1151. The 1.7B checkpoint is
 supported; 0.6B, forced alignment and audio GGUFs are unsupported. Python runs
 only offline reference checks. Generation is deterministic greedy decoding.

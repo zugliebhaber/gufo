@@ -1,11 +1,13 @@
 # Qwen3.8 Flash-Next
 
+> Part of the [model index](../README.md); see the [architecture](../../ARCHITECTURE.md), [CLI](../../CLI.md) and [README quickstart](../../../README.md#quickstart).
+
 Hybrid recurrent/QSA mixture-of-experts text/image model on gfx1151.
 Supported target: `unsloth/Qwen3.8-Flash-Next-GGUF`, **UD-Q4_K_XL** (four shards).
 Optional shared-Q8 MTP predictor; optional BF16 vision projector.
 Original unquantized-model and GGUF-conversion parity remain unqualified.
 
-[Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [ROCm 10.1 status](ROCM.md)
+[Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [N1-N9 levers](N-LEVERS.md) · [ROCm 10.1 status](ROCM.md)
 
 ## Load and run
 
@@ -21,6 +23,21 @@ MTP=/path/to/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
 ./result/bin/gufo serve llm --model "$MODEL" --speculative mtp \
   --mtp-model "$MTP" --sessions 2 --context 32768
 ```
+
+### Serving settings at a glance
+
+| Setting | Flag | Notes |
+| --- | --- | --- |
+| context per session | `--context N` | native 262144; above needs `--enable-yarn` |
+| resident sessions | `--sessions N` | 1 = lowest memory/latency; 32 = one 32-row decode pass for throughput |
+| prefill work unit | `--prefill-chunk N` | default 16384; capped by free KV |
+| RAM prefix cache | `--cache-ram-bytes N\|off` | default auto; `off` for cold benchmarks |
+| disk continuation | `--cache-disk DIR` | one process per directory |
+| KV budget | `--kv-pool-bytes N\|off` | default free device memory, at most sessions x context |
+| speculative decode | `--speculative mtp --mtp-model PATH` | single-user latency; keep off for exact AR A/B |
+| draft width | `--draft-tokens N` | adaptive default; 1-7 proposals |
+| reasoning | `--think on\|off\|auto`, `--reasoning-effort`, `--reasoning-budget` | thinking tokens count toward the response |
+| request coalescing | `GUFO_REQUEST_COALESCE=1` | byte-identical greedy requests, opt-in |
 
 The loader discovers the remaining shards. Omit the speculative options for AR;
 AR sessions allocate no predictor state even if a shared model has MTP loaded.
@@ -106,6 +123,52 @@ attention kernel rather than the fused WMMA kernel. Memory grows with used
 context and selected rollback depth (about 27.5 KiB per context token with
 MTP, measured on gfx1151); admission reserves the configured capacity before
 creating sessions.
+
+## Batching, widths and limits
+
+Decode runs in waves of the model's batch width. This model advertises batched
+plans from two to **32 rows** (`kMaxBatchSessions`), so a 32-session pool
+decodes in one physical pass; MTP drafting keeps its eight-row gate, which
+means a wider cohort decodes autoregressively. Width is a throughput/latency
+trade: 24 rows deliver about 94% of the 32-row aggregate rate, while keeping
+noticeably more per-request decode rate and lower TTFT. The [retained 8/16/24/32
+table](BENCHMARKS.md#2026-11-05-re-measurement-with-the-coalescing-build)
+shows 24 vs 32 as about 321-324 vs 342-343 tok/s aggregate, 5.74-5.75 vs 4.85
+per-request TG and 10.20-10.24 vs 13.78 s TTFT in the latest runs.
+
+Prefill runs one pass at a time. A pass pays a fixed full expert-weight read
+plus a per-token part, so short prompts spend most of the pass on that fixed
+cost. An experimental pairing (`GUFO_BATCHED_PREFILL=1`) puts two cold prompts
+into one pass to share the read; it is off by default and not bit-identical to
+serial prefill, because the row-batched GEMM tiles differ with the row count.
+
+### Cache, coalescing and the canonical benchmark
+
+The canonical benchmark gives every request a **unique, front-loaded nonce**
+and runs with `--cache-ram-bytes off`: it measures cold prefill and unique
+decode rows. Two separate workloads exercise reuse:
+
+- **Shared-prefix cache:** leave `--cache-ram-bytes` at auto (or use
+  `--cache-disk` for restart-safe continuation). A shared-prefix c32 run
+  measured 94.67 -> 119.94 output tok/s (+26.7%) and 13.87 -> 0.223 s TTFT
+  when the cache was enabled; the physical-token sum falls because cached
+  prefill is logged as zero. Report output and TTFT for this workload.
+- **Request coalescing:** `GUFO_REQUEST_COALESCE=1` shares one greedy stream
+  between byte-identical requests. A 32-identical batch measured 44.410 ->
+  4.891 s (9.08x; an earlier 264-token prompt gave 9.53x), 4096 identical
+  output tokens. The canonical unique-nonce benchmark does not trigger it and
+  its on/off difference is noise. See
+  [N-LEVERS](N-LEVERS.md#request-coalescing-opt-in) for scope and limits
+  (greedy only; no stops/logprobs/penalties; followers have no KV; leader
+  cancellation ends the group).
+
+Use the [batch table](BENCHMARKS.md#2026-11-05-re-measurement-with-the-coalescing-build)
+for the fresh 8/16/24/32 numbers and [N-LEVERS](N-LEVERS.md) for the lever
+verdicts.
+
+The scheduler's stall watchdog is on by default: generation that makes no
+progress for `--stall-timeout-ms` (default 180000) reports `device_lost` and
+exits, instead of holding sessions forever.
 
 ## Images
 

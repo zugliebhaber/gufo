@@ -12,6 +12,67 @@ Terminal generation and HTTP serving share model runtimes, tokenizers, and
 sampling. The HTTP scheduler also manages concurrent requests and persistent
 prompt caching.
 
+## Quickstart
+
+```sh
+# one-shot generation
+gufo prompt --model MODEL -p "Explain paged KV cache" -n 256 -t 0 --think off
+
+# interactive terminal
+gufo chat --model MODEL
+
+# OpenAI-compatible server (throughput point)
+gufo serve --host 0.0.0.0 --port 8080 --sessions 32   llm --model MODEL --context 1024 --prefill-chunk 16384   --cache-ram-bytes off
+
+# direct model benchmark (prompt 336, generate 128)
+gufo bench --model MODEL -p 336 -n 128
+
+# hardware/driver/profile check
+gufo diagnose
+```
+
+`gufo help <command>` is authoritative. The [README
+quickstart](../README.md#quickstart) has the container and native recipes; the
+[architecture](ARCHITECTURE.md) explains the request flow.
+
+### Config names and CLI flags
+
+The feature list below uses the conceptual/config names (for example
+`prefillChunk`); the executable uses kebab-case flags. The common mapping:
+
+| Config / feature | CLI flag |
+| --- | --- |
+| `context` | `--context` |
+| `prefillChunk` | `--prefill-chunk` |
+| `maxTokens` | `--max-tokens` |
+| `servedModelName` | `--served-model-name` |
+| `sessions` | `--sessions` |
+| `cacheRam` budget | `--cache-ram-bytes` |
+| `cacheDisk`, `cacheDiskBytes`, `cacheDiskStagingBytes` | `--cache-disk`, `--cache-disk-bytes`, `--cache-disk-staging-bytes` |
+| `maxPending`, `maxPendingPerClient` | `--max-pending`, `--max-pending-per-client` |
+| `requestTimeoutMs`, `stallTimeoutMs` | `--request-timeout-ms`, `--stall-timeout-ms` |
+| `maxOutputBytes`, `maxBufferedOutputBytes`, `maxBufferedOutputTotal` | `--max-output-bytes`, `--max-buffered-output-bytes`, `--max-buffered-output-total` |
+| `speculative`, companion model, `draftTokens`, `draftPolicy`, `minDraftTokens` | `--speculative`, `--dflash-model`/`--dspark-model`/`--mtp-model`, `--draft-tokens`, `--draft-policy`, `--min-draft-tokens` |
+| `think`, `reasoningEffort`, `preserveThinking`, `reasoningBudget` | `--think`, `--reasoning-effort`, `--preserve-thinking`, `--reasoning-budget` |
+| `temperature`, `topK`, `topP`, `minP`, `minKeep`, `seed`, penalties | `--temperature`, `--top-k`, `--top-p`, `--min-p`, `--min-keep`, `--seed`, `--repeat-penalty`, `--repeat-last-n`, `--frequency-penalty`, `--presence-penalty` |
+
+### Request coalescing and shared prefixes
+
+- **Request coalescing** is opt-in: `GUFO_REQUEST_COALESCE=1 gufo serve …`.
+  It shares one greedy stream between byte-identical prompts. Followers have
+  no runner request or KV; their `prefill_tokens` are zero. It only applies to
+  greedy requests with no stops, logprobs, penalties, constraints or
+  prompt-progress stream, and a follower token limit no larger than the
+  leader's. A 32-identical batch measured 44.410 -> 4.891 s (9.08x); the
+  canonical unique-nonce benchmark does not trigger it. See the
+  [N-LEVERS scope](models/qwen3.8-flash-next/N-LEVERS.md#request-coalescing-opt-in).
+- **Shared-prefix cache** uses the RAM/disk continuation cache. Leave
+  `--cache-ram-bytes` at auto for repeated/shared prefixes; `off` is the cold
+  benchmark. A shared-prefix c32 run improved output from 94.67 to 119.94
+  tok/s (+26.7%) and TTFT from 13.87 s to 0.223 s, while the physical-token
+  total fell because cached prefill is logged as zero. Report output/TTFT for
+  cached workloads. Details: [Flash-Next benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md).
+
 ## Functionalities
 
 This is an exhaustive list of functionalities and features offered by the gufo cli, the mapping between features and flags is not documented here and should be discovered using the `--help` command to avoid divergences between the implementation and the documentation.
@@ -127,7 +188,9 @@ seed. Speed depends on acceptance and verification cost.
   practice: prevents stuck requests from holding GPU sessions forever.
 - `stallTimeoutMs` — the server exits as `device_lost` when generation makes
   no progress for this many milliseconds, so the service manager restarts
-  it. Off unless set; at least 60000.
+  it. Default 180000 (three minutes), which is about sixty times the longest
+  legitimate no-progress window (one prefill chunk); 0 disables it, and other
+  values must be at least 60000.
 - `maxOutputBytes` — maximum response size per request.
 - `maxBufferedOutputBytes` — maximum generated-but-not-yet-delivered output
   buffered for one request; protects against slow clients.
@@ -207,8 +270,11 @@ These apply to every modality, before or after the subcommand:
   port will not answer. Use `--host ::` to listen on IPv6 and IPv4 together.
 - `sessions` (`-j`) — preallocated GPU request sessions. In practice: more
   sessions means more requests can compute at once, at the cost of memory
-  per session. This option applies to LLM serving; image and speech servers use
-  their own bounded queues. The embedding server packs waiting text requests
+  per session. A model executes ready decoders in waves of its own batch
+  width, so the pool can exceed it: Qwen3.8 Flash-Next serves up to 32 rows
+  per decode pass, Qwen3.8 27B and DeepSeek V4 Flash eight. This option
+  applies to LLM serving; image and speech servers use their own bounded
+  queues. The embedding server packs waiting text requests
   into shared device batches and runs each request with images in its own
   batch. `--max-connections` bounds the waiting requests.
 - `maxConnections` — maximum simultaneous HTTP connections. In practice:

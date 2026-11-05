@@ -15,6 +15,11 @@ for user-facing changes and release history.
 > [!TIP]
 > Check out **[Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo)**, a Gufo variant that has not been merged yet!
 
+**New here?** Jump to the [Quickstart](#quickstart), the
+[commands and settings](#commands-and-settings), or the
+[architecture](docs/ARCHITECTURE.md). The complete documentation index is
+[docs/README.md](docs/README.md).
+
 ## Models and benchmarks
 
 All model documentation lives under [docs/models](docs/models/README.md):
@@ -36,6 +41,13 @@ individual request decode rates. Qwen27B's single-user peak uses the short-promp
 C1 workload. Audio excludes loading.
 Each model guide lists the required files and complete benchmark settings.
 
+The table reports per-model peaks with the named speculative mode. For Qwen3.8
+Flash-Next the fresh cold canonical 8/16/24/32 table and the latest on/off A/B
+(c32: 342.00 off vs 343.47 on; noise) are in the
+[Flash-Next benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md#2026-11-05-re-measurement-with-the-coalescing-build);
+the 32-identical request-coalescing A/B is 9.08x in wall/output. Scope and
+limits are in [N-LEVERS](docs/models/qwen3.8-flash-next/N-LEVERS.md).
+
 ## Philosophy
 
 - Contributions are welcome! We need the help of Strix Halo community to keep improving gufo!
@@ -47,6 +59,20 @@ Each model guide lists the required files and complete benchmark settings.
 - Keep production dependencies small and development tools separate.
 
 ## Quickstart
+
+### Choose a path
+
+| Path | Use it when | First step |
+| --- | --- | --- |
+| **Container, one model** | you want the fastest reproducible start | the Podman block below |
+| **Native build** | you develop or need a different model set | `nix build`, then `./result/bin/gufo …` |
+| **Qwen3.8 Flash-Next** | 256K context, MoE, 32-session throughput | [Flash-Next guide](docs/models/qwen3.8-flash-next/README.md) |
+| **Audio / image / video** | TTS, ASR, embeddings, image, video | [model index](docs/models/README.md) |
+| **API clients** | OpenAI SDK, Open WebUI, Codex | [server contract](docs/SERVER.md) |
+
+The Podman recipe below is the complete text-only path for Qwen3.8 27B with
+DFlash2. Replace the model and speculative flags for another checkpoint; see
+its model guide for the exact files.
 
 ```sh
 hf download unsloth/Qwen3.8-27B-GGUF \
@@ -122,6 +148,73 @@ The text server uses the model's native context by default and generates until
 EOS or the context is full. `--context N` sets context capacity per session;
 `--max-tokens N` sets a default response limit that clients can override.
 Reasoning tokens count toward that response limit.
+
+## Commands and settings
+
+### Commands
+
+| Command | Purpose | Example |
+| --- | --- | --- |
+| `gufo serve` | OpenAI/Anthropic-compatible HTTP server | `gufo serve --host 0.0.0.0 --port 8080 llm --model MODEL` |
+| `gufo prompt` | one-shot generation, scriptable | `gufo prompt --model MODEL -p "Hello" -n 128 -t 0` |
+| `gufo chat` | interactive terminal chat | `gufo chat --model MODEL` |
+| `gufo bench` | direct prompt/decode throughput | `gufo bench --model MODEL -p 336 -n 128` |
+| `gufo diagnose` | hardware, driver and power-profile checks | `gufo diagnose` |
+| `gufo eval` | evaluate an already running OpenAI server | `gufo eval --help` |
+| `gufo transcribe` | one-shot ASR | `gufo transcribe --model DIR --audio audio.wav` |
+| `gufo serve tts/asr/embedding/image/video` | non-text modalities | see [CLI](docs/CLI.md) |
+
+The CLI accepts server options before or after the modality command in the
+documented forms. `gufo help <command>` is authoritative; the [CLI
+guide](docs/CLI.md) explains the feature list and the [server
+contract](docs/SERVER.md) covers HTTP behavior.
+
+### Settings that matter
+
+| Setting | Flag / environment | When to change it |
+| --- | --- | --- |
+| context per session | `--context N` | long prompts or many sessions; Flash-Next above 262144 needs `--enable-yarn` |
+| resident sessions | `--sessions N` | 1 for lowest memory/latency, 8-32 for aggregate throughput |
+| prefill work unit | `--prefill-chunk N` | larger amortises expert reads; capped by free KV |
+| default response cap | `--max-tokens N` | bound cost; clients can still override |
+| RAM prefix cache | `--cache-ram-bytes N\|off` (default auto) | keep repeated/shared prefixes warm; `off` for cold benchmarks |
+| disk cache | `--cache-disk DIR --cache-disk-bytes N` | restart-safe continuation, one process per directory |
+| KV pool | `--kv-pool-bytes N\|off` | cap resident KV; `off` = one full-context session |
+| sampling | `--temperature`, `--top-k`, `--top-p`, `--min-p`, `--seed`, penalties | deterministic vs creative; `0` selects greedy |
+| reasoning | `--think on\|off\|auto`, `--reasoning-effort`, `--preserve-thinking`, `--reasoning-budget` | control thinking tokens and context cost |
+| speculation | `--speculative dflash2\|dspark\|mtp`, companion model path, `--draft-tokens` | decode latency; keep off for exact AR comparisons |
+| HTTP limits | `--max-connections`, `--max-pending`, `--max-pending-per-client`, `--request-timeout-ms` | protect the machine from bursts |
+| stall watchdog | `--stall-timeout-ms N` | restart instead of hanging on a wedged device |
+| API auth | `--api-key KEY` | expose beyond localhost |
+| served name | `--served-model-name ID` | client-facing model id |
+| request coalescing | `GUFO_REQUEST_COALESCE=1` | byte-identical greedy requests; opt-in, see [N-LEVERS](docs/models/qwen3.8-flash-next/N-LEVERS.md#request-coalescing-opt-in) |
+| logs/trace | `--log-level`, `--log-progress`, `--trace PATH` | debug; the trace contains client content |
+
+**Serving recipes.** Throughput: `--sessions 32 --context 1024` with cache off
+for the canonical measurement; latency: `--sessions 1`; long-context
+Flash-Next: `--context 32768` or the native 262144 (above 262144 needs
+`--enable-yarn`); single-user Flash-Next: `--speculative mtp --mtp-model …`;
+shared prefixes: leave `--cache-ram-bytes` at auto and report output/TTFT;
+duplicate requests: set `GUFO_REQUEST_COALESCE=1` (greedy identical only).
+The canonical benchmark is cold and uses unique nonces, so it does not exercise
+the cache or coalescing; see the [Flash-Next benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md) and
+[N-LEVERS](docs/models/qwen3.8-flash-next/N-LEVERS.md).
+
+### Architecture at a glance
+
+```mermaid
+flowchart LR
+    CLI["CLI<br/>prompt · chat · bench"] --> PROC["gufo process"]
+    HTTP["HTTP clients<br/>OpenAI / Anthropic"] --> PROC
+    PROC --> SCH["scheduler<br/>queues · plans · cache"]
+    SCH --> RUN["model runner<br/>+ GPU executor"]
+    RUN --> KER["HIP kernels<br/>GEMM · attention · MoE"]
+    RUN --> MEM["unified memory<br/>weights · KV · state · cache"]
+```
+
+The [architecture document](docs/ARCHITECTURE.md) has the request lifecycle,
+prefill/decode and MoE dataflow, memory/cache hierarchy, coalescing sequence,
+benchmark flow and the architecture decision records.
 
 ## Harness notes
 

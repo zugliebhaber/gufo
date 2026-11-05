@@ -1,5 +1,7 @@
 # CI workflows
 
+> See the [testing guide](TESTING.md), [development guide](DEVELOPMENT.md) and [documentation index](README.md).
+
 Workflow names identify the platform and purpose. Job and step names start with
 an action. Reusable workflow callers appear as `caller / called job` in GitHub.
 All workflow files below live in `.github/workflows/`.

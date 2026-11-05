@@ -81,6 +81,12 @@ every iteration (`requests_processing`, `max_consecutive_active_prefill_chunks
 capped by free KV capacity and by the remaining prompt, and shrinks to the
 adaptation floor under pressure.
 
+One prefill pass runs at a time, and a pass costs a fixed full expert-weight
+read plus a per-token part, so short prompts spend most of the pass on that
+fixed cost. An experimental, off-by-default pairing
+(`GUFO_BATCHED_PREFILL=1`) puts two cold prompts into one pass to share the
+read; it is not bit-identical to serial prefill and stays opt-in.
+
 KV and prefill work draw from the same unified memory as the weights, so the
 scheduler reads the host's free RAM (after cgroup limits) with a 2 GiB reserve.
 When free memory or the runner's KV claim, minus the tokens the resident batch
@@ -98,6 +104,9 @@ the larger of 16 and `--sessions`, so a burst as wide as the batch is queued
 instead of refused (`--max-pending 0` keeps that automatic bound). A model
 executes ready decoders in waves of its own batch width, so a pool wider than
 that width still admits and serves every session; unified memory, not the
+scheduler, is the real limit.
+
+that width still admits and serves every session; unified memory, not the
 scheduler, is the real limit. Requests beyond the admitted batch wait for a
 session; none is ever swapped out. When the admitted batch has to shrink, the
 scheduler uses RECOMPUTE preemption: the newest residents release their model
@@ -107,6 +116,17 @@ with the same sampler. `llamacpp:preemptions_total` and
 reclaimed for the remaining batch instead of being parked in host memory. The
 [knee sweep](../tools/gufo/serving_sweep.py) measures where a wider batch stops
 paying for itself.
+
+The batch width is a per-model capability. Qwen3.8 Flash-Next advertises
+batched plans from two to **32 rows**, so a 32-session pool decodes in one
+physical pass; its MTP drafting stays on the eight-row gate, which means a
+wider cohort decodes autoregressively. Qwen3.8 27B and DeepSeek V4 Flash keep
+their eight-row limit, because a sixteen-row plan split their K-quant attention
+projections into two eight-row passes and lost 3-6% aggregate throughput.
+Decode width is also a throughput/latency trade: on Flash-Next, widths 24 and
+32 deliver nearly the same total rate, while 24 keeps noticeably more
+per-request decode rate and lower TTFT
+([measurements](models/qwen3.8-flash-next/BENCHMARKS.md)).
 
 Text serving defaults match llama.cpp for context and generation length:
 
@@ -517,6 +537,42 @@ HTTP workers submit requests through `TextGenerationBackend`. The text
 scheduler owns request state and serializes model execution. Model runners own
 weights, tokenization, prefill/decode, speculative verification and complete
 cache snapshots. HTTP handlers do not implement model kernels.
+
+## Request coalescing and shared prefixes
+
+The text scheduler can share work between compatible requests. Two mechanisms
+exist, with different contracts:
+
+- **Request coalescing** (`GUFO_REQUEST_COALESCE=1`, opt-in): byte-identical
+  greedy requests share one logical decode stream. The first admitted request
+  is the leader and owns the only runner request, KV/recurrent state and
+  prefill. Followers have no runner request, receive the leader's token
+  selections and carry `prefill_tokens=0` in usage/logs. A follower is only
+  admitted while the leader has not published a token, so a late request never
+  receives a partial stream. Follower cancellation/deadline removes only that
+  follower; a leader cancellation/failure completes the group (no leader
+  promotion yet). The path only matches greedy requests with byte-identical
+  prompts and identical `stop_at_eos`/`cache_prompt`, no stop sequences,
+  logprobs, constraints, penalties or prompt-progress stream, and a follower
+  token limit no larger than the leader's. See [the architecture decision
+  record](ARCHITECTURE.md#adr-5-coalescing-only-for-exact-duplicate-greedy-streams)
+  and [N-LEVERS](models/qwen3.8-flash-next/N-LEVERS.md#request-coalescing-opt-in).
+- **Shared-prefix cache** (default RAM cache): a repeated or shared prefix can
+  be restored instead of recomputed. Leave `--cache-ram-bytes` at its default
+  (auto) for this workload; `off` keeps each session's live state but retains
+  no checkpoints. `--cache-disk DIR` adds restart-safe continuation, one owner
+  per directory. A cache hit logs `prefill_tokens=0` for the restored part, so
+  the physical-token total can fall even when output throughput and TTFT
+  improve. Report output/wall/TTFT for cached workloads. See
+  [KV cache](KV-CACHE.md) and the [Flash-Next
+  benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md).
+
+The canonical serving benchmark deliberately uses unique, front-loaded nonces
+and `--cache-ram-bytes off`; it measures cold prefill and unique decode rows
+and must not be used to claim a coalescing or cache speedup. The separate
+measurements are in [the Flash-Next
+benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md) and
+[N-LEVERS](models/qwen3.8-flash-next/N-LEVERS.md).
 
 ## Endpoint Set
 
@@ -1365,9 +1421,12 @@ and follows the lost-device path above, including the exit with status 75 and
 the `gufo_device_lost_total` increment. This covers a hang on the scheduler
 thread, in a capture the scheduler is waiting for, and in the idle device
 probe. Detection takes between `MS` and about 1.5 times `MS`. Requests already
-in flight end when the process exits. The default, 0, disables the check;
-other values must be at least 60000, because a deep checkpoint capture or a
-post-failure device probe can legitimately hold progress for tens of seconds.
+in flight end when the process exits. The default is 180000 (three minutes);
+0 disables the check, and other values must be at least 60000, because a deep
+checkpoint capture or a post-failure device probe can legitimately hold progress
+for tens of seconds. The default is deliberately finite: an unattended run that
+stopped advancing used to wait forever, and three minutes is about sixty times
+the longest legitimate no-progress window (one prefill chunk).
 An idle server and a queued request never count as stalled. While any other
 request is still progressing, a hung capture is not reported; it is once
 nothing else can run. A disk-cache write that never completes is not detected

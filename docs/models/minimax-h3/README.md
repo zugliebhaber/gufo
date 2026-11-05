@@ -1,5 +1,7 @@
 # MiniMax H3
 
+> Part of the [model index](../README.md); see the [architecture](../../ARCHITECTURE.md), [CLI](../../CLI.md) and [README quickstart](../../../README.md#quickstart).
+
 [Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [ROCm migration](ROCM.md)
 
 Gufo runs the text-only FL2VA path on Linux gfx1151: prompt encoding, the

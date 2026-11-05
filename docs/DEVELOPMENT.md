@@ -1,5 +1,7 @@
 # Development
 
+> See the [documentation index](README.md), [architecture](ARCHITECTURE.md), [testing](TESTING.md) and [CLI guide](CLI.md).
+
 Production targets Linux x86-64 on AMD Strix Halo (`gfx1151`). CMake owns the
 compiler flags, dependencies and installation for every build; Nix supplies the
 pinned toolchain. System dependencies and the qualified compiler/ROCm versions

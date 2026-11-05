@@ -22,6 +22,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/logging.hpp"
@@ -110,6 +111,13 @@ struct ScheduledRequest {
   std::atomic<TextRequestPhase> phase{TextRequestPhase::kQueued};
 
   TextRunnerPool::Request runner_request;
+  // Opt-in shared-prefix/request coalescing. A follower has no runner request
+  // and no session; it receives the leader's greedy token stream.
+  std::vector<TextRunnerToken> coalesce_prompt;
+  bool coalesce_eligible{false};
+  bool coalesced_follower{false};
+  std::weak_ptr<ScheduledRequest> coalesce_leader;
+  std::vector<std::shared_ptr<ScheduledRequest>> coalesce_followers;
   TextGenerationScheduler::Result result;
   std::optional<TextGenerationScheduler::Clock::time_point> previous_token;
   std::chrono::duration<double, std::milli> inter_token_total{0};
@@ -577,6 +585,14 @@ struct TextGenerationScheduler::Impl {
         scheduler_policy.request_timeout.count() < 0 ||
         scheduler_policy.stall_timeout.count() < 0) {
       throw std::invalid_argument("invalid text scheduler limits");
+    }
+    // How many requests may share one prefill pass. Two is the cohort size that
+    // has been correctness-qualified; GUFO_PREFILL_COHORT raises it for
+    // experiments and is clamped to what the engine accepts.
+    if (const char* cohort = std::getenv("GUFO_PREFILL_COHORT")) {
+      const auto requested = std::strtoul(cohort, nullptr, 10);
+      prefill_cohort_limit =
+          std::clamp<std::size_t>(static_cast<std::size_t>(requested), 1, 8);
     }
     incremental_prefill_supported =
         runner_pool->runner().Descriptor().capabilities.incremental_prefill;
@@ -1264,6 +1280,37 @@ struct TextGenerationScheduler::Impl {
     return snapshot;
   }
 
+  /// Cancels and reaps coalesced followers. A follower owns no model session,
+  /// so this is the only place its own deadline/cancellation is observed while
+  /// the leader is still prefilling or between decode steps.
+  void ProcessCoalescedFollowers(
+      std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
+      std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+      std::deque<std::shared_ptr<ScheduledRequest>>& capturing) {
+    for (auto* list : {&prefilling, &decoding, &capturing}) {
+      for (auto& leader : *list) {
+        auto& followers = leader->coalesce_followers;
+        for (auto it = followers.begin(); it != followers.end();) {
+          if (!*it || IsTerminal(*it)) {
+            it = followers.erase(it);
+            continue;
+          }
+          if (CompleteIfStopped(*it)) {
+            it = followers.erase(it);
+            continue;
+          }
+          ++it;
+        }
+        if (IsTerminal(leader) && !followers.empty()) {
+          for (auto& follower : followers)
+            if (follower && !IsTerminal(follower))
+              CompleteCancelled(follower);
+          followers.clear();
+        }
+      }
+    }
+  }
+
   void FinalizeResult(const std::shared_ptr<ScheduledRequest>& request,
                       TextGenerationBackend::FinishReason finish_reason) {
     request->result.completion_tokens = request->result.tokens.size();
@@ -1282,6 +1329,13 @@ struct TextGenerationScheduler::Impl {
   void CompleteCancelled(
       const std::shared_ptr<ScheduledRequest>& request) noexcept {
     EndPublicationWait(request, "cancelled");
+    if (!request->coalesce_followers.empty()) {
+      auto followers = std::move(request->coalesce_followers);
+      request->coalesce_followers.clear();
+      for (auto& follower : followers)
+        if (follower && !IsTerminal(follower))
+          CompleteCancelled(follower);
+    }
     if (device_lost.load(std::memory_order_acquire)) {
       CompleteFailure(request, device_lost_failure);
       return;
@@ -1316,6 +1370,13 @@ struct TextGenerationScheduler::Impl {
       return;
     if (!classified)
       failure = ClassifyFailure(std::move(failure));
+    if (!request->coalesce_followers.empty()) {
+      auto followers = std::move(request->coalesce_followers);
+      request->coalesce_followers.clear();
+      for (auto& follower : followers)
+        if (follower && !IsTerminal(follower))
+          CompleteFailure(follower, failure, true);
+    }
     if (request->runner_request) {
       if (device_lost.load(std::memory_order_acquire)) {
         // Retain the lease, snapshots and their workers until process exit.
@@ -1448,6 +1509,13 @@ struct TextGenerationScheduler::Impl {
 
   void CompleteSuccess(const std::shared_ptr<ScheduledRequest>& request,
                        TextGenerationBackend::FinishReason finish_reason) {
+    if (!request->coalesce_followers.empty()) {
+      auto followers = std::move(request->coalesce_followers);
+      request->coalesce_followers.clear();
+      for (auto& follower : followers)
+        if (follower && !IsTerminal(follower))
+          CompleteSuccess(follower, finish_reason);
+    }
     if (request->stop_filter.enabled()) {
       auto tail = request->stop_filter.Finish();
       request->result.text += tail;
@@ -1456,33 +1524,35 @@ struct TextGenerationScheduler::Impl {
             TextGenerationErrorCode::kOutputBackpressure,
             "text generation buffered output limit exceeded");
     }
-    // A stop may land on a preview, an unadvanced AR token, or inside an
-    // accepted speculative block. Retain only correctly labelled executed
-    // state, using the same cache reconciliation as an interrupted request.
-    // Read before the commit returns the leased state.
-    const auto ngram = request->runner_request.ngram_rows();
-    request->result.ngram_rows = ngram.rows;
-    request->result.ngram_dedup_rows = ngram.dedup_rows;
-    request->result.ngram_cache_hits = ngram.cache_hits;
-    request->result.ngram_disk_reads = ngram.disk_reads;
-    const auto cache_commit =
-        finish_reason == TextGenerationBackend::FinishReason::kStopSequence
-            ? request->runner_request.Cancel()
-            : request->runner_request.Commit();
-    request->result.component_cache = cache_commit.component_cache;
-    request->result.cache_shared_bytes =
-        cache_commit.component_cache
-            ? cache_commit.component_cache->shared_bytes
-            : 0;
-    request->result.cache_snapshot_bytes = cache_commit.snapshot_bytes;
-    request->result.cache_snapshot_ms = cache_commit.snapshot_ms;
-    request->result.cache_disk_queued_bytes = cache_commit.disk_queued_bytes;
-    request->result.cache_disk_enqueue_ms = cache_commit.disk_enqueue_ms;
-    request->result.cache_shared_prefix_snapshots =
-        cache_commit.shared_prefix_snapshots;
-    request->result.cache_shared_prefix_bytes =
-        cache_commit.shared_prefix_bytes;
-    request->result.cache_shared_prefix_ms = cache_commit.shared_prefix_ms;
+    if (request->runner_request) {
+      // A stop may land on a preview, an unadvanced AR token, or inside an
+      // accepted speculative block. Retain only correctly labelled executed
+      // state, using the same cache reconciliation as an interrupted request.
+      // Read before the commit returns the leased state.
+      const auto ngram = request->runner_request.ngram_rows();
+      request->result.ngram_rows = ngram.rows;
+      request->result.ngram_dedup_rows = ngram.dedup_rows;
+      request->result.ngram_cache_hits = ngram.cache_hits;
+      request->result.ngram_disk_reads = ngram.disk_reads;
+      const auto cache_commit =
+          finish_reason == TextGenerationBackend::FinishReason::kStopSequence
+              ? request->runner_request.Cancel()
+              : request->runner_request.Commit();
+      request->result.component_cache = cache_commit.component_cache;
+      request->result.cache_shared_bytes =
+          cache_commit.component_cache
+              ? cache_commit.component_cache->shared_bytes
+              : 0;
+      request->result.cache_snapshot_bytes = cache_commit.snapshot_bytes;
+      request->result.cache_snapshot_ms = cache_commit.snapshot_ms;
+      request->result.cache_disk_queued_bytes = cache_commit.disk_queued_bytes;
+      request->result.cache_disk_enqueue_ms = cache_commit.disk_enqueue_ms;
+      request->result.cache_shared_prefix_snapshots =
+          cache_commit.shared_prefix_snapshots;
+      request->result.cache_shared_prefix_bytes =
+          cache_commit.shared_prefix_bytes;
+      request->result.cache_shared_prefix_ms = cache_commit.shared_prefix_ms;
+    }
     FinalizeResult(request, finish_reason);
     LogDecodeProgress(request, true);
     // Recorded here rather than by the HTTP adapter, so a client that leaves
@@ -1710,6 +1780,40 @@ struct TextGenerationScheduler::Impl {
         if (CompleteIfStopped(request)) {
           continue;
         }
+        // A second byte-identical greedy request joins the resident leader
+        // instead of acquiring a model session of its own. The leader must be
+        // at least as long-lived, so a request with a larger token limit stays
+        // independent and becomes its own leader.
+        if (request->coalesce_eligible) {
+          std::shared_ptr<ScheduledRequest> coalesce_leader;
+          for (auto* list : {&prefilling, &decoding, &capturing}) {
+            for (auto& candidate : *list) {
+              if (candidate && candidate->coalesce_eligible &&
+                  !candidate->coalesced_follower && !IsTerminal(candidate) &&
+                  candidate->result.tokens.empty() &&
+                  request->token_limit <= candidate->token_limit &&
+                  request->stop_at_eos == candidate->stop_at_eos &&
+                  request->cache_prompt == candidate->cache_prompt &&
+                  request->coalesce_prompt == candidate->coalesce_prompt) {
+                coalesce_leader = candidate;
+                break;
+              }
+            }
+            if (coalesce_leader)
+              break;
+          }
+          if (coalesce_leader) {
+            request->coalesced_follower = true;
+            request->coalesce_leader = coalesce_leader;
+            request->phase.store(TextRequestPhase::kPrefilling,
+                                 std::memory_order_release);
+            request->result.execution_plan = "coalesced";
+            request->result.physical_execution_width = 1;
+            request->admitted_once = true;
+            coalesce_leader->coalesce_followers.push_back(request);
+            continue;
+          }
+        }
         if (WaitForSharedPrefix(request, residents, waiting.size())) {
           waiting.push_back(std::move(request));
           continue;
@@ -1834,10 +1938,46 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
-  void StepPrefill(const std::shared_ptr<ScheduledRequest>& request,
-                   bool decoder_runnable, std::size_t resident_tokens,
-                   std::size_t pending_decoders, bool peer_waiting = false,
-                   const std::shared_ptr<ScheduledRequest>& peer = nullptr) {
+  /// Pops up to `prefill_cohort_limit - 1` eligible peers for a batched
+  /// prefill pass. Eligibility is uniform: plain prompt arithmetic with no
+  /// planned checkpoint, so the shared pass runs no per-request capture.
+  std::vector<std::shared_ptr<ScheduledRequest>> TakePrefillPeers(
+      std::deque<std::shared_ptr<ScheduledRequest>>& prefilling) {
+    std::vector<std::shared_ptr<ScheduledRequest>> peers;
+    while (peers.size() + 1 < prefill_cohort_limit && !prefilling.empty() &&
+           prefilling.front()->runner_request.CanBatchPrefill()) {
+      peers.push_back(std::move(prefilling.front()));
+      prefilling.pop_front();
+    }
+    return peers;
+  }
+
+  /// Routes a request that just ran a prefill chunk back into its queue.
+  void SettlePrefilled(
+      const std::shared_ptr<ScheduledRequest>& request, bool mark_decode_due,
+      std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
+      std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+      std::deque<std::shared_ptr<ScheduledRequest>>& capturing) {
+    if (!request || IsTerminal(request) || AwaitingKvRetry(request))
+      return;
+    if (request->runner_request.SnapshotPending()) {
+      capturing.push_back(request);
+      return;
+    }
+    if (request->runner_request.prefill_complete()) {
+      if (mark_decode_due)
+        request->decode_due = true;
+      decoding.push_back(request);
+      return;
+    }
+    prefilling.push_back(request);
+  }
+
+  void StepPrefill(
+      const std::shared_ptr<ScheduledRequest>& request, bool decoder_runnable,
+      std::size_t resident_tokens, std::size_t pending_decoders,
+      bool peer_waiting = false,
+      std::span<const std::shared_ptr<ScheduledRequest>> peers = {}) {
     try {
       if (CompleteIfStopped(request)) {
         return;
@@ -1885,7 +2025,7 @@ struct TextGenerationScheduler::Impl {
         }
       }
       request->result.prefill_budget_tokens = budget;
-      if (peer) {
+      for (const auto& peer : peers) {
         peer->phase.store(TextRequestPhase::kPrefilling,
                           std::memory_order_release);
         peer->result.prefill_budget_tokens = budget;
@@ -1894,18 +2034,21 @@ struct TextGenerationScheduler::Impl {
           !incremental_prefill_supported) {
         request->result.prefill_fallback_reason =
             "incremental_prefill_unavailable";
-        if (peer)
+        for (const auto& peer : peers)
           peer->result.prefill_fallback_reason =
               "incremental_prefill_unavailable";
       }
       const auto start = Clock::now();
       TextPrefillStep step;
-      std::optional<TextPrefillStep> peer_step;
-      if (peer) {
-        auto steps =
-            request->runner_request.PrefillBatch(peer->runner_request, budget);
+      std::vector<TextPrefillStep> peer_steps;
+      if (!peers.empty()) {
+        std::vector<TextRunnerPool::Request*> batch;
+        batch.reserve(peers.size());
+        for (const auto& peer : peers)
+          batch.push_back(&peer->runner_request);
+        auto steps = request->runner_request.PrefillBatch(batch, budget);
         step = steps.front();
-        peer_step = steps.back();
+        peer_steps.assign(steps.begin() + 1, steps.end());
       } else {
         step = request->runner_request.Prefill(budget);
       }
@@ -1924,40 +2067,41 @@ struct TextGenerationScheduler::Impl {
         LogPrefillProgress(target, value.consumed_tokens, step_ms);
         PublishPromptProgress(target);
       };
-      const std::size_t step_tokens =
-          step.consumed_tokens +
-          (peer_step ? peer_step->consumed_tokens : std::size_t{0});
+      std::size_t step_tokens = step.consumed_tokens;
+      for (const auto& peer_step : peer_steps)
+        step_tokens += peer_step.consumed_tokens;
       if (!decoder_runnable && !peer_waiting)
         publication_prefill.Observe(step_tokens, step_ms);
       detail::TotalPromptTokens().fetch_add(step_tokens,
                                             std::memory_order_relaxed);
       record(request, step);
-      if (peer && peer_step)
-        record(peer, *peer_step);
-      if (peer && peer_step && Logger::Enabled(LogLevel::kInfo)) {
+      for (std::size_t i = 0; i < peer_steps.size(); ++i)
+        record(peers[i], peer_steps[i]);
+      if (!peers.empty() && Logger::Enabled(LogLevel::kInfo)) {
+        std::string tokens = std::to_string(step.consumed_tokens);
+        for (const auto& peer_step : peer_steps)
+          tokens += "+" + std::to_string(peer_step.consumed_tokens);
         Logger::Info(
             "scheduler",
             "event=batched_prefill request=" + std::to_string(request->id) +
-                " peer=" + std::to_string(peer->id) +
-                " tokens=" + std::to_string(step.consumed_tokens) + "+" +
-                std::to_string(peer_step->consumed_tokens) +
-                " ms=" + std::to_string(step_ms));
+                " cohort=" + std::to_string(peers.size() + 1) +
+                " tokens=" + tokens + " ms=" + std::to_string(step_ms));
       }
 
       if (decoder_runnable) {
         ++request->result.active_decode_prefill_chunks;
-        if (peer && peer_step) {
+        // A peer that ran its chunk in this pass counts it against the same
+        // active-decode episode.
+        for (const auto& peer : peers)
           ++peer->result.active_decode_prefill_chunks;
-        }
         ++consecutive_active_prefill_chunks;
         request->result.max_consecutive_active_prefill_chunks =
             std::max(request->result.max_consecutive_active_prefill_chunks,
                      consecutive_active_prefill_chunks);
-        if (peer && peer_step) {
+        for (const auto& peer : peers)
           peer->result.max_consecutive_active_prefill_chunks =
               std::max(peer->result.max_consecutive_active_prefill_chunks,
                        consecutive_active_prefill_chunks);
-        }
       } else {
         consecutive_active_prefill_chunks = 0;
       }
@@ -1969,15 +2113,17 @@ struct TextGenerationScheduler::Impl {
       request->phase.store(step.decode_ready ? TextRequestPhase::kDecodeReady
                                              : TextRequestPhase::kPrefilling,
                            std::memory_order_release);
-      if (peer && peer_step) {
-        peer->phase.store(peer_step->decode_ready
-                              ? TextRequestPhase::kDecodeReady
-                              : TextRequestPhase::kPrefilling,
-                          std::memory_order_release);
+      for (std::size_t i = 0; i < peers.size(); ++i) {
+        peers[i]->phase.store(peer_steps[i].decode_ready
+                                  ? TextRequestPhase::kDecodeReady
+                                  : TextRequestPhase::kPrefilling,
+                              std::memory_order_release);
       }
     } catch (...) {
       const auto failure = std::current_exception();
-      if (peer && !IsTerminal(peer)) {
+      for (const auto& peer : peers) {
+        if (IsTerminal(peer))
+          continue;
         if (IsKvExhaustion(failure)) {
           (void)DegradeKvExhausted(peer);
         } else if (!CompleteIfStopped(peer)) {
@@ -2109,6 +2255,28 @@ struct TextGenerationScheduler::Impl {
     }
     if (request->stop_filter.stopped())
       request->result.stop_sequence = request->stop_filter.matched_sequence();
+    // Coalesced replicas receive the leader's exact token stream. Their own
+    // token limit may be smaller; a follower that reaches it is finalized
+    // while the leader keeps running for the remaining replicas.
+    if (!request->coalesce_followers.empty()) {
+      const auto followers = request->coalesce_followers;
+      for (const auto& follower : followers) {
+        if (!follower || IsTerminal(follower))
+          continue;
+        if (!PublishSelection(follower, selection))
+          continue;
+        follower->phase.store(TextRequestPhase::kDecoding,
+                              std::memory_order_release);
+        if (follower->stop_filter.stopped()) {
+          CompleteSuccess(follower,
+                          TextGenerationBackend::FinishReason::kStopSequence);
+          continue;
+        }
+        if (follower->result.tokens.size() >= follower->token_limit)
+          CompleteSuccess(follower,
+                          TextGenerationBackend::FinishReason::kLength);
+      }
+    }
     if (CompleteIfStopped(request)) {
       return false;
     }
@@ -2616,6 +2784,7 @@ struct TextGenerationScheduler::Impl {
         break;
       loop_working.store(true, std::memory_order_relaxed);
       ProcessQueuedCancellations();
+      ProcessCoalescedFollowers(prefilling, decoding, capturing);
 
       for (std::size_t count = capturing.size(); count != 0; --count) {
         auto request = std::move(capturing.front());
@@ -2750,34 +2919,16 @@ struct TextGenerationScheduler::Impl {
           (!due_decoder || assemble_initial_batch)) {
         auto request = std::move(prefilling.front());
         prefilling.pop_front();
-        // Two cold prompts share one model pass when both are plain prompt
+        // Cold prompts share one model pass when all of them are plain prompt
         // arithmetic: the expert weight read is paid once for the cohort.
-        std::shared_ptr<ScheduledRequest> peer;
-        if (!prefilling.empty() && request->runner_request.CanBatchPrefill() &&
-            prefilling.front()->runner_request.CanBatchPrefill()) {
-          peer = std::move(prefilling.front());
-          prefilling.pop_front();
-        }
+        std::vector<std::shared_ptr<ScheduledRequest>> peers;
+        if (request->runner_request.CanBatchPrefill())
+          peers = TakePrefillPeers(prefilling);
         StepPrefill(request, true, resident_tokens, pending_decoders, false,
-                    peer);
-        if (!IsTerminal(request) && !AwaitingKvRetry(request)) {
-          if (request->runner_request.SnapshotPending()) {
-            capturing.push_back(std::move(request));
-          } else if (request->runner_request.prefill_complete()) {
-            decoding.push_back(std::move(request));
-          } else {
-            prefilling.push_back(std::move(request));
-          }
-        }
-        if (peer && !IsTerminal(peer) && !AwaitingKvRetry(peer)) {
-          if (peer->runner_request.SnapshotPending()) {
-            capturing.push_back(std::move(peer));
-          } else if (peer->runner_request.prefill_complete()) {
-            decoding.push_back(std::move(peer));
-          } else {
-            prefilling.push_back(std::move(peer));
-          }
-        }
+                    peers);
+        SettlePrefilled(request, false, prefilling, decoding, capturing);
+        for (const auto& peer : peers)
+          SettlePrefilled(peer, false, prefilling, decoding, capturing);
         MarkAllDecodersDue(decoding);
         continue;
       }
@@ -2820,34 +2971,14 @@ struct TextGenerationScheduler::Impl {
       // request keeps the bulk work unit, which is the efficient kernel path.
       const bool peer_waiting =
           !capturing.empty() || !prefilling.empty() || !waiting.empty();
-      std::shared_ptr<ScheduledRequest> peer;
-      if (!prefilling.empty() && request->runner_request.CanBatchPrefill() &&
-          prefilling.front()->runner_request.CanBatchPrefill()) {
-        peer = std::move(prefilling.front());
-        prefilling.pop_front();
-      }
+      std::vector<std::shared_ptr<ScheduledRequest>> peers;
+      if (request->runner_request.CanBatchPrefill())
+        peers = TakePrefillPeers(prefilling);
       StepPrefill(request, false, resident_tokens, pending_decoders,
-                  peer_waiting, peer);
-      if (!IsTerminal(request) && !AwaitingKvRetry(request)) {
-        if (request->runner_request.SnapshotPending()) {
-          capturing.push_back(std::move(request));
-        } else if (request->runner_request.prefill_complete()) {
-          request->decode_due = true;
-          decoding.push_back(std::move(request));
-        } else {
-          prefilling.push_back(std::move(request));
-        }
-      }
-      if (peer && !IsTerminal(peer) && !AwaitingKvRetry(peer)) {
-        if (peer->runner_request.SnapshotPending()) {
-          capturing.push_back(std::move(peer));
-        } else if (peer->runner_request.prefill_complete()) {
-          peer->decode_due = true;
-          decoding.push_back(std::move(peer));
-        } else {
-          prefilling.push_back(std::move(peer));
-        }
-      }
+                  peer_waiting, peers);
+      SettlePrefilled(request, true, prefilling, decoding, capturing);
+      for (const auto& peer : peers)
+        SettlePrefilled(peer, true, prefilling, decoding, capturing);
     }
     for (auto& request : capturing)
       decoding.push_back(std::move(request));
@@ -2883,6 +3014,8 @@ struct TextGenerationScheduler::Impl {
           TextGenerationErrorCode::kDeviceLost, kDeviceLostMessage));
   std::vector<std::shared_ptr<ScheduledRequest>> device_lost_requests;
   std::size_t consecutive_active_prefill_chunks{0};
+  /// Requests that may share one prefill pass, including the lead request.
+  std::size_t prefill_cohort_limit{2};
   /// Prefilling request that last triggered a KV relief; scheduler-thread only.
   std::uint64_t kv_relieved_request{0};
   /// Decoders reclaimed during the current pressure episode. Reset once the
@@ -3162,6 +3295,21 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->publish_token_pieces = publish_token_pieces;
   request->publish_prompt_progress =
       publish_token_pieces && metadata.return_progress;
+  // Coalescing is only valid for deterministic, unfiltered greedy decoding:
+  // every replica must receive exactly the leader's token stream. Different
+  // stop sequences, logprobs, constraints, penalties or prompt progress keep
+  // the ordinary independent path.
+  request->coalesce_prompt = request->prompt;
+  request->coalesce_eligible =
+      std::getenv("GUFO_REQUEST_COALESCE") != nullptr &&
+      request->sampling.temperature == 0.0F && request->sampling.top_k == 0 &&
+      request->sampling.top_p == 1.0F && request->sampling.min_p == 0.0F &&
+      request->sampling.min_keep == 0 && !request->sampling.logprobs &&
+      !request->sampling.constraint && !request->sampling.reasoning_budget &&
+      request->sampling.repeat_penalty == 1.0F &&
+      request->sampling.frequency_penalty == 0.0F &&
+      request->sampling.presence_penalty == 0.0F &&
+      !request->stop_filter.enabled() && !request->publish_prompt_progress;
   request->request_start = metadata.request_start;
   request->stream_start_deadline =
       request->request_start + impl_->scheduler_policy.stream_start_delay;

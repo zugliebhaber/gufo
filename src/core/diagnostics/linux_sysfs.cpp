@@ -218,4 +218,32 @@ std::vector<SysfsGpuDevice> LinuxSysfs::QueryDrmGpuDevices() const {
   return devices;
 }
 
+std::string ReadPowerProfile(const std::filesystem::path& sys_root) {
+  const auto cards = std::filesystem::path(sys_root) / "class" / "drm";
+  std::error_code error;
+  if (!std::filesystem::is_directory(cards, error)) {
+    return {};
+  }
+  for (const auto& card : std::filesystem::directory_iterator(
+           cards, std::filesystem::directory_options::skip_permission_denied,
+           error)) {
+    const auto name = card.path().filename().string();
+    if (!name.starts_with("card") || name.find('-') != std::string::npos) {
+      continue;
+    }
+    std::ifstream file(card.path() / "device" /
+                       "power_dpm_force_performance_level");
+    if (!file.is_open()) {
+      continue;
+    }
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    const std::string level = Trim(buffer.str());
+    if (!level.empty()) {
+      return level;
+    }
+  }
+  return {};
+}
+
 }  // namespace gufo::diagnostics

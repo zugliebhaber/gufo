@@ -1,5 +1,7 @@
 # Building Gufo (Windows / Strix Halo)
 
+> See the [documentation index](docs/README.md), [architecture](docs/ARCHITECTURE.md) and [README quickstart](README.md#quickstart).
+
 Windows x86-64 is a supported native build target for development, sharing
 the source tree of the Linux production build. Production packages are cut
 from the Linux build. The device toolchain differs: `clang-cl` and the HIP

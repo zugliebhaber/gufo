@@ -180,6 +180,29 @@ diagnostics::DiagnosticReport CollectDiagnostics(
     report.AddCheck(std::move(check));
   }
 
+  // 3b. Power profile (N6): the dpm level decides whether a measurement sees
+  // the driver's ramp-up and the compositor's share of the iGPU. Advisory
+  // only: `auto` is a valid operating point, just not a reproducible baseline.
+  if (section == "all" || section == "gpu" || section == "inventory") {
+    diagnostics::DiagnosticCheck check;
+    check.name = "power_profile";
+    const std::string profile = diagnostics::ReadPowerProfile();
+    check.details["powerDpmPerformanceLevel"] =
+        profile.empty() ? "unavailable" : profile;
+    if (profile == "high") {
+      check.status = diagnostics::DiagnosticStatus::kPass;
+      check.message = "GPU clocks pinned to the high performance level";
+    } else {
+      check.status = diagnostics::DiagnosticStatus::kWarn;
+      check.message =
+          "GPU clocks are not pinned to high; the run includes dpm ramp-up and "
+          "any compositor work on the iGPU. Pin with: echo high | sudo tee "
+          "/sys/class/drm/card1/device/power_dpm_force_performance_level";
+      report.AddWarning("GPU power profile is not pinned to high");
+    }
+    report.AddCheck(std::move(check));
+  }
+
   // 4. Toolchain Check
   if (section == "all" || section == "inventory") {
     diagnostics::DiagnosticCheck check;

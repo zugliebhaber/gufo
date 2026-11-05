@@ -4,6 +4,11 @@ Linux x86-64 / AMD Strix Halo gfx1151 is the production target. Build with
 `nix build`; Python/reference toolchains are development-only. Model weights
 are downloaded separately and are not part of the runtime package.
 
+Start with the [documentation index](../README.md), the [architecture
+overview](../ARCHITECTURE.md) and the [README
+quickstart](../../README.md#quickstart). The [CLI guide](../CLI.md) maps
+features to flags; `gufo help <command>` is authoritative.
+
 | Model | Weights / supported inputs | Guide |
 | --- | --- | --- |
 | DeepSeek V4 Flash | Flash 0731 mixed IQ2/Q2/Q8 GGUF; text | [Usage and modes](deepseek-v4-flash/README.md) |
@@ -14,6 +19,22 @@ are downloaded separately and are not part of the runtime package.
 | Qwen3-TTS 12Hz 1.7B | BF16 safetensors; text/reference audio to speech | [Voice modes](qwen3-tts/README.md) |
 | Qwen-Image-2.1 | BF16 safetensors; generation and image editing | [Usage](qwen-image-2.1/README.md) |
 | MiniMax H3 FL2VA | Pinned safetensors; text to audiovisual output | [Presets and usage](minimax-h3/README.md) |
+
+## Serving recipes
+
+| Goal | Start |
+| --- | --- |
+| lowest latency / one user | `--sessions 1`; Qwen3.8 27B with DFlash2, Flash-Next with MTP |
+| aggregate throughput | `--sessions 8`-`32`; Flash-Next uses a single 32-row pass |
+| long context | `--context N`; Flash-Next above 262144 needs `--enable-yarn` |
+| restart-safe continuation | `--cache-disk DIR` with one owner per directory |
+| repeated/shared prefixes | leave `--cache-ram-bytes` at auto; report output and TTFT, not only physical tokens |
+| duplicate greedy requests | `GUFO_REQUEST_COALESCE=1`; opt-in, identical prompt/sampling only |
+| cold reproducible benchmark | `--cache-ram-bytes off` and unique prompts; the canonical table |
+
+The exact files and benchmark settings are in each model's `README.md` and
+`BENCHMARKS.md`. For the batch/coalescing/cache trade-offs see the
+[architecture decisions](../ARCHITECTURE.md#8-architecture-decisions).
 
 Each model folder contains:
 

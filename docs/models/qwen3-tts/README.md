@@ -1,5 +1,7 @@
 # Qwen3-TTS 12Hz 1.7B
 
+> Part of the [model index](../README.md); see the [architecture](../../ARCHITECTURE.md), [CLI](../../CLI.md) and [README quickstart](../../../README.md#quickstart).
+
 Native gfx1151 speech synthesis from BF16 safetensors, with an F32 waveform
 decoder. Checkpoint configuration selects the variant; 0.6B, 25Hz and GGUF
 checkpoints are unsupported. Official Python is an offline oracle only.

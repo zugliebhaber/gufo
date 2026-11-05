@@ -96,6 +96,30 @@ hide work. See [serving benchmark commands](PERFORMANCE.md) for invocation.
 speculative token traces. Request correctness, acceptance, and end-to-end
 speed are separate requirements.
 
+## Cache and coalescing workloads
+
+The canonical table is deliberately cold: unique front-loaded nonces and
+`--cache-ram-bytes off`. Do not use it to claim prefix-cache or request-
+coalescing gains. Run those workloads separately:
+
+- **Shared-prefix cache:** `--shared-prefix` with the RAM cache at auto. Report
+  output tok/s, TTFT and wall time. A cache hit logs `prefill_tokens=0` for the
+  restored part, so the physical-token sum can fall even when output and TTFT
+  improve (c32: 94.67 -> 119.94 output tok/s, +26.7%; 13.87 -> 0.223 s TTFT).
+- **Request coalescing:** `GUFO_REQUEST_COALESCE=1` on byte-identical greedy
+  requests. The leader owns the only prefill/KV; followers log
+  `prefill_tokens=0`. A 32-identical batch measured 44.410 -> 4.891 s (9.08x;
+  4096 identical output tokens). The canonical unique-nonce on/off difference
+  is +0.43..+0.91% (noise, no group).
+- **Physical-token totals** count executed prefill and are not a fair score for
+  deduplicated/cached work; keep output throughput, TTFT and wall time
+  alongside them.
+
+The current tables are in
+[the Flash-Next benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md); the
+lever/scope notes are in
+[N-LEVERS](models/qwen3.8-flash-next/N-LEVERS.md).
+
 ## Quality method (matched-token, per position)
 
 Use the independent references and model-owned limits described in

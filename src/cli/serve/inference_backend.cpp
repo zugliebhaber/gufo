@@ -1212,8 +1212,10 @@ public:
             .physical_width = 1,
         },
     };
-    // Report actual session widths, including C6. The widest plan keeps sixteen
-    // rows resident so 16 simultaneous decoders run in one shared pass.
+    // Report actual session widths, including C6. The widest plan this dense
+    // path advertises is eight rows: a sixteen-row plan split the K-quant
+    // attention projections into two eight-row passes and lost 3-6% aggregate
+    // throughput. Flash-Next has its own plan set and goes to 32 rows.
     for (std::size_t width = 2; width <= MaximumDecodeBatchWidth(); ++width) {
       plans.push_back({
           .kind = TextExecutionPlanKind::kBatched,

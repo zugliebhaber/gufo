@@ -1,5 +1,7 @@
 # Releasing
 
+> See the [documentation index](README.md) and [development guide](DEVELOPMENT.md).
+
 Gufo uses squash merges and Conventional Commit pull request titles to keep
 `main` machine-readable. A pull request may contain arbitrary work-in-progress
 commits; its title becomes the single commit retained on `main`.

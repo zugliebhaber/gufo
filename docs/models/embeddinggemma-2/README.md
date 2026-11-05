@@ -1,5 +1,7 @@
 # EmbeddingGemma 2
 
+> Part of the [model index](../README.md); see the [architecture](../../ARCHITECTURE.md), [CLI](../../CLI.md) and [README quickstart](../../../README.md#quickstart).
+
 Native safetensors text, image, video and audio embeddings on gfx1151. Gufo runs [google/embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2), a 768-dimensional embedding model for 100+ languages and code, through `POST /v1/embeddings`. Text, images, video and audio share one vector space. Python runs only in offline reference checks.
 
 [Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [ROCm 10.1](ROCM.md)

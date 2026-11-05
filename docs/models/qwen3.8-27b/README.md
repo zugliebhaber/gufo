@@ -1,5 +1,7 @@
 # Qwen3.8 27B
 
+> Part of the [model index](../README.md); see the [architecture](../../ARCHITECTURE.md), [CLI](../../CLI.md) and [README quickstart](../../../README.md#quickstart).
+
 Dense text/image model on gfx1151. Production target GGUFs are **UD-Q4_K_XL**
 (16.35 GiB weights) and **UD-Q8_K_XL** (29.30 GiB); request state and an optional
 draft/projector need additional memory. BF16 targets are reference-only.

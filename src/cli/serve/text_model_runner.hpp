@@ -647,8 +647,12 @@ public:
     [[nodiscard]] bool CanBatchPrefill() const;
     /// Prefills this request and `peer` in one model pass and returns their
     /// steps in that order. Both must satisfy `CanBatchPrefill`.
+    /// Runs one model pass for this request plus `peers`.
+    ///
+    /// Every request must satisfy `CanBatchPrefill`. The returned steps are in
+    /// the order `this`, then `peers`.
     [[nodiscard]] std::vector<TextPrefillStep> PrefillBatch(
-        Request& peer, std::size_t max_input_tokens);
+        std::span<Request* const> peers, std::size_t max_input_tokens);
     [[nodiscard]] TextDecodeSelection SelectNext();
     void Advance();
     [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens);

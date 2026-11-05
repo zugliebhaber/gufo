@@ -1,5 +1,21 @@
 # Qwen3.8 Flash-Next experiments
 
+## Batched prefill cohort (November 3, 2026)
+
+Two cold prompts in one prefill pass, so the fixed full expert-weight read is
+paid once. Strix Halo (ROCm 10.1), UD-Q4_K_XL, `gufo serve --sessions 16
+--context 2048 --prefill-chunk 16384`, greedy, thinking off, cache off, two
+identical 702-token prompts, one warmup plus two measured rounds. The cohort
+path is `Executor::ForwardPrefillBatch` + `Model::PrefillBatch` + scheduler
+peer pairing, gated behind `GUFO_BATCHED_PREFILL=1`.
+
+| Experiment | Outcome |
+| --- | --- |
+| Two prompts per pass, single-session wide arithmetic (`HcMix`/`Combine`/`Moe`) instead of the decode-tiled `DenseBatch` | Retained as opt-in. The first build routed the mixer projections through the eight-row decode tiling, which re-reads each 3.3 MB mixer weight 359 times at a 2870-row cohort: 3252 ms instead of the modelled 2190 ms. With the wide arithmetic the pass takes 1157/1077 ms for 2 x 702 tokens (1213/1303 tok/s) against 945 tok/s for the serial model at that length, i.e. +28-38% prefill throughput. |
+| Output head under the decode policy, one row per item | Retained. `ForwardBody` restores the decode policy around its head; the cohort now does the same. Running it under the prompt policy changed the frontier token. |
+| Keep the fused `half_only`/`no_f32` staging | Rejected. It leaves the F32 `mixed` rows unwritten and relies on the F16 cache, which cannot be shared across per-session row views. Both paths now compute the full F32 mix; the default path stayed bit-identical (189f9e81/b9dc0063/56d2de5c/3d03cf8b) and throughput-neutral. |
+| Bit-identity of the cohort against serial prefill | Open. The cohort is plausible but not bit-identical (0882c637/938e77e0/d83ef30c/568e23bf): the wide GEMM tiles differ with the row count, so the layer-0 mixer already differs (`sumsq` 921 serial vs 1150 cohort) and greedy tokens diverge from layer 0. Bit-identity needs M-invariant row-batched GEMMs, so the path stays opt-in. |
+
 ## Confidence-gated MTP chains (October 29, 2026)
 
 Upstream `main` 34ebb5fe against the branch, Strix Halo (ROCm 7.2.4), UD-Q4_K_XL + shared Q8_0 MTP, `gufo serve --sessions 1 --context 65536`, greedy, thinking off, five fixed prompts (CPU caches, a Python red-black tree, TCP congestion control, Czech railway history, a C++ ISO 8601 parser) of 384 generated tokens; one server process per arm, means of the five decode rates. The first process after another workload reads cold PLE rows and runs 2-4% slower, so every hold started with a discarded warm-up and main ran before and after the candidates.
