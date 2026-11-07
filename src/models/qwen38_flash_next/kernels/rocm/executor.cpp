@@ -22,6 +22,7 @@
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/pages.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/debug_dump.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -796,9 +797,10 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   view.mtp_ = source.mtp_;
   if (source.mtp_enabled_) {
     view.mtp_.position = view.position_ - 1;
-    view.mtp_.blocks = view.mtp_.position > c.indexer_top_k
-                           ? view.mtp_.position / c.compress_ratio
-                           : source.mtp_.blocks;
+    view.mtp_.blocks =
+        c.compress_ratio > 0 && view.mtp_.position > c.indexer_top_k
+            ? view.mtp_.position / c.compress_ratio
+            : source.mtp_.blocks;
     if (prefix > 1)
       view.mtp_.residual_valid = false;
   }
@@ -1652,6 +1654,10 @@ std::size_t Executor::SessionBytes(
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
   const std::size_t kv =
       2 * std::size_t{max_context} * c.AttentionKvDim() * sizeof(__half);
+  // A paged session keeps its KV rows in the shared pool and allocates only
+  // the block table here. Charging the full context again would make auto
+  // sizing scale with max_context instead of the state a session really owns.
+  const std::size_t private_attention_kv = kv_pool_ == nullptr ? kv : 0;
   const std::size_t index =
       std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
           c.indexer_head_dim * sizeof(float) +
@@ -1666,8 +1672,8 @@ std::size_t Executor::SessionBytes(
   return ((linear * conv + ple) * (rollback_depth + 1) +
           linear * rollback_state) *
              sizeof(float) +
-         linear * state * sizeof(SsmState) + attention * (kv + index) +
-         sizeof(Session::Control) +
+         linear * state * sizeof(SsmState) +
+         attention * (private_attention_kv + index) + sizeof(Session::Control) +
          (mode == core::SessionMode::kSpeculative
               ? kv + index +
                     std::size_t{options_.max_speculative + 1} * c.HcDim() *
@@ -1989,9 +1995,12 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
       }
     }
   };
-  if (WidePrefill(n_tokens)) {
-    // Prefill batches: 64-token tiles for the down projection, then 128-token
-    // tiles for the paired gate/up projections.
+  if (WidePrefill(n_tokens) || ExpertMatrixRows(n_tokens)) {
+    // Prefill and wide decode batches: 64-token tiles for the down
+    // projection, then 128-token tiles for the paired gate/up projections.
+    // A 256-row decode plan collapses onto a few hot experts, so the wider
+    // buckets read each expert's weights once or twice per layer instead of
+    // once per 16 rows.
     append(64);
     routed_64_tiles_ = n_tiles;
     routed_pair_offset_ = n_tiles;
@@ -3299,7 +3308,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
         session.position_ + static_cast<std::uint32_t>(tokens.size());
     session.continuation_hooks_->BeforeWrite(
         false, session.position_, end, session.blocks_,
-        end > c.indexer_top_k ? end / c.compress_ratio : session.blocks_);
+        c.compress_ratio > 0 && end > c.indexer_top_k ? end / c.compress_ratio
+                                                      : session.blocks_);
   }
   const auto ngram = session.ngram_;
   if (c.ple_layer >= 0) {
@@ -3428,6 +3438,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     session.vision_input_.Inject(s_.res, start_pos, n, c.hidden_size,
                                  c.hc_count, stream_);
   }
+  debug::DumpPrefillLayer("serial", 0, s_.res, n * c.HcDim());
   const auto& layers = model_->layers();
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
@@ -3497,6 +3508,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
           !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
         return false;
       Combine(s_.res, next_norm, rows, next_inject);
+      debug::DumpPrefillLayer("serial", il + 1, s_.res, n * c.HcDim());
       return true;
     };
     if (skipped != 0) {
@@ -4071,7 +4083,7 @@ std::uint64_t Executor::PrefillCheckpointBytes(const Session& session,
                  : session.blocks_;
   if (session.mtp_enabled_) {
     h.mtp_position = position - 1;
-    h.mtp_blocks = h.mtp_position > c.indexer_top_k
+    h.mtp_blocks = c.compress_ratio > 0 && h.mtp_position > c.indexer_top_k
                        ? h.mtp_position / c.compress_ratio
                        : session.mtp_.blocks;
     h.hidden_rows =

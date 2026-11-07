@@ -268,10 +268,29 @@ void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
                       ServerLogOptions* log) {
   parser.AddOption("-i", "--host", "IP", "Bind address", "Server", host);
   parser.AddOption("-p", "--port", "N", "Port to listen on", "Server", port);
-  if (session_count != nullptr)
-    parser.AddOption("-j", "--sessions", "N",
-                     "Preallocated GPU request sessions", "Server",
-                     session_count);
+  if (session_count != nullptr) {
+    parser.AddCustomOption(
+        "-j", "--sessions", "N|auto",
+        "Preallocated GPU request sessions; auto sizes to context and VRAM",
+        "Server",
+        [session_count](std::string_view, std::string_view value,
+                        std::string* error) {
+          if (value == "auto") {
+            *session_count = 0;
+            return true;
+          }
+          std::size_t parsed = 0;
+          const auto end = value.data() + value.size();
+          const auto result = std::from_chars(value.data(), end, parsed);
+          if (value.empty() || result.ec != std::errc{} || result.ptr != end ||
+              parsed == 0) {
+            *error = "--sessions must be a positive integer or auto";
+            return false;
+          }
+          *session_count = parsed;
+          return true;
+        });
+  }
   parser.AddOption("", "--max-connections", "N",
                    "Maximum simultaneous HTTP connections", "Server",
                    max_connections);
@@ -953,9 +972,10 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --port must be between 0 and 65535\n";
       return false;
     }
-    if (session_count == 0 || max_connections == 0 ||
+    if ((session_count == 0 && subcommand != "llm") || max_connections == 0 ||
         max_request_body_bytes == 0) {
-      std::cerr << "Error: server limits must be positive\n";
+      std::cerr << "Error: server limits must be positive (sessions auto is "
+                   "supported only for llm)\n";
       return false;
     }
     // Arm verbosity here: this runs after every server option is parsed and
@@ -998,7 +1018,8 @@ int RunServe(std::span<const char* const> args) {
       server::Logger::Warn(
           "gpu",
           "power_profile=" + power_profile +
-              " (clocks not pinned to high; throughput includes dpm ramp-up and "
+              " (clocks not pinned to high; throughput includes dpm ramp-up "
+              "and "
               "compositor work; pin with: echo high | sudo tee "
               "/sys/class/drm/card1/device/power_dpm_force_performance_level)");
     }
@@ -1462,8 +1483,11 @@ int RunServe(std::span<const char* const> args) {
       return 0;
     }
     if (max_pending_requests == 0) {
+      // Auto mode must not turn a demand burst into queue rejections: size the
+      // default pending bound from the accepted connection limit.
       max_pending_requests =
-          std::max(server::kDefaultPendingRequests, session_count);
+          std::max(server::kDefaultPendingRequests,
+                   session_count == 0 ? max_connections : session_count);
     }
     if (max_pending_requests_per_client == 0) {
       max_pending_requests_per_client = max_pending_requests;
@@ -1675,9 +1699,12 @@ int RunServe(std::span<const char* const> args) {
         served_names += "," + ids[i];
     }
     load_log.Complete(
-        "model=" + backend->model_id() +
-        " sessions=" + std::to_string(session_count) + " context_tokens=" +
-        std::to_string(backend->max_context()) + " speculative=" + speculation +
+        "model=" + backend->model_id() + " sessions=" +
+        (session_count == 0
+             ? "auto(" + std::to_string(backend->session_states().size()) + ")"
+             : std::to_string(session_count)) +
+        " context_tokens=" + std::to_string(backend->max_context()) +
+        " speculative=" + speculation +
         " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
         " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled") +
         served_names);

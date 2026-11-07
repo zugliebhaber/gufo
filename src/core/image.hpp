@@ -12,8 +12,9 @@
 
 namespace gufo::core {
 
-inline constexpr std::size_t kMaxEncodedImageBytes = 20 * 1024 * 1024;
-inline constexpr std::size_t kMaxImagePixels = 32 * 1024 * 1024;
+inline constexpr std::size_t kMaxEncodedImageBytes =
+    std::size_t{20} * 1024 * 1024;
+inline constexpr std::size_t kMaxImagePixels = std::size_t{32} * 1024 * 1024;
 
 struct Image {
   std::uint32_t width{0};

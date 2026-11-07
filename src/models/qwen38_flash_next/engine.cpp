@@ -341,6 +341,12 @@ std::size_t Model::ResidentBytes() const noexcept {
   return device_->resident_bytes() + (vision_ ? vision_->ResidentBytes() : 0);
 }
 
+std::optional<qwen::KvPoolSnapshot> Model::KvPoolSnapshot() const noexcept {
+  if (!executor_ || executor_->kv_pool() == nullptr)
+    return std::nullopt;
+  return executor_->kv_pool()->Snapshot();
+}
+
 std::size_t Model::SessionBytes(core::SessionMode mode,
                                 std::uint32_t context) const noexcept {
   const std::size_t vision =
@@ -925,7 +931,8 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
 bool Model::PrefillBatch(std::span<const PrefillBatchItem> items,
                          std::string* error_msg) {
   if (items.empty() || items.size() > kMaxBatchSessions) {
-    AssignError(error_msg, "prefill batch must contain 1..32 sessions");
+    AssignError(error_msg, "prefill batch must contain 1.." +
+                               std::to_string(kMaxBatchSessions) + " sessions");
     return false;
   }
   struct Tail {
@@ -976,7 +983,12 @@ bool Model::PrefillBatch(std::span<const PrefillBatchItem> items,
   std::string shared_error;
   while (!tails.empty()) {
     batch.clear();
-    const std::size_t group = std::min<std::size_t>(tails.size(), 2);
+    // One executor pass carries every tail the scheduler handed over. The
+    // per-tail share keeps the total row count within max_batch; the caller
+    // decides how many requests form the cohort. Bound the group by the row
+    // budget so a tiny context cannot overflow a wide cohort.
+    const std::size_t group = std::min<std::size_t>(
+        tails.size(), std::max<std::size_t>(exec.max_batch(), 1));
     const std::size_t share =
         std::max<std::size_t>(exec.max_batch() / group, 1);
     for (std::size_t i = 0; i < group; ++i) {
@@ -1441,8 +1453,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
     return false;
   }
   if (!gpu_verification || cpu_rows) {
-    std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
-                logits_.begin());
+    std::copy_n(
+        verify_logits_.data() + static_cast<std::size_t>(keep - 1) * vocab,
+        vocab, logits_.begin());
   }
   hidden_base_ = base;
   tokens_.insert(tokens_.end(), chain.begin(), chain.begin() + keep);
@@ -1526,7 +1539,8 @@ template<class Request>
 bool Session::RunIsolatedBatch(std::span<const Request> requests,
                                std::string* error_msg) {
   if (requests.empty() || requests.size() > kMaxBatchSessions) {
-    AssignError(error_msg, "batch must contain 1..32 sessions");
+    AssignError(error_msg, "batch must contain 1.." +
+                               std::to_string(kMaxBatchSessions) + " sessions");
     return false;
   }
   std::array<BatchOutcome, kMaxBatchSessions> outcomes{};

@@ -707,7 +707,11 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
             input_stride, 32);
     return;
   }
-  if (!gate && matrix_shape && tokens >= 9 && tokens <= 48) {
+  // All ungated 9..48-row batches use the 16/32/48-token matrix kernel:
+  // it reuses one weight block across the whole tile instead of one block per
+  // eight-row wave. The scheduler's 8k+1 hold-back keeps the plan on full
+  // 8/16/24/32 tiles, so this path sees the requested ladder.
+  if (!gate && tokens >= 9 && tokens <= 48) {
     if (tokens <= 16)
       launch_q8_matrix<1>(weights, input, output, k, rows, tokens, input_stride,
                            stream);

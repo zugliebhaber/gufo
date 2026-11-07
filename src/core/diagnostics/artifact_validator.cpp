@@ -4,6 +4,7 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 
 #include "src/core/diagnostics/fingerprint.h"
 #include "src/core/json.hpp"
@@ -14,35 +15,35 @@ namespace {
 
 constexpr std::size_t kMaxArtifactBytes = 16 * 1024 * 1024;
 
-const json::Value& Object(const json::Value& parent, const std::string& name) {
-  const auto* value = parent.find(name);
+const json::Value& Object(const json::Value& parent, std::string_view name) {
+  const auto* value = parent.find(std::string{name});
   if (!value || !value->is_object())
-    throw std::invalid_argument("Expected object '" + name + "'");
+    throw std::invalid_argument("Expected object '" + std::string{name} + "'");
   return *value;
 }
 
-std::string String(const json::Value& object, const std::string& name) {
-  const auto* value = object.find(name);
+std::string String(const json::Value& object, std::string_view name) {
+  const auto* value = object.find(std::string{name});
   if (!value || !value->is_string())
-    throw std::invalid_argument("Expected string '" + name + "'");
+    throw std::invalid_argument("Expected string '" + std::string{name} + "'");
   return value->str();
 }
 
-std::uint64_t Uint(const json::Value& object, const std::string& name,
+std::uint64_t Uint(const json::Value& object, std::string_view name,
                    std::uint64_t maximum = 9007199254740991ULL) {
-  const auto* value = object.find(name);
+  const auto* value = object.find(std::string{name});
   if (!value || !value->is_number() || value->as_double() < 0 ||
       value->as_double() > static_cast<double>(maximum) ||
       std::floor(value->as_double()) != value->as_double())
-    throw std::invalid_argument("Expected bounded unsigned integer '" + name +
-                                "'");
+    throw std::invalid_argument("Expected bounded unsigned integer '" +
+                                std::string{name} + "'");
   return static_cast<std::uint64_t>(value->as_double());
 }
 
-bool Boolean(const json::Value& object, const std::string& name) {
-  const auto* value = object.find(name);
+bool Boolean(const json::Value& object, std::string_view name) {
+  const auto* value = object.find(std::string{name});
   if (!value || !value->is_bool())
-    throw std::invalid_argument("Expected boolean '" + name + "'");
+    throw std::invalid_argument("Expected boolean '" + std::string{name} + "'");
   return value->as_bool();
 }
 

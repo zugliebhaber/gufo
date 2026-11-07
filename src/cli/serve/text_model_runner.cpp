@@ -241,8 +241,9 @@ struct ValidatedRunner {
 /// paid per session too. A runner that shares one scratch set across states
 /// reports zero scratch here instead — which is what the Flash-Next claim does,
 /// because its runtime scratch is allocated once at model load. Charging the
-/// scratch only once while the states each allocate their own would under-reserve
-/// by (states - 1) scratch sets and let the pool overcommit device memory.
+/// scratch only once while the states each allocate their own would
+/// under-reserve by (states - 1) scratch sets and let the pool overcommit
+/// device memory.
 std::optional<std::size_t> AggregateReservationBytes(
     const TextRunnerResourceClaim& resources, std::size_t state_count) {
   if (!resources.per_request_state_bytes.has_value() ||
@@ -260,6 +261,34 @@ std::optional<std::size_t> AggregateReservationBytes(
     throw std::invalid_argument("text runner aggregate claim overflows");
   }
   return per_state_total * state_count;
+}
+
+std::size_t FitAutoSessionCount(const TextModelRunner& runner,
+                                std::size_t ceiling) {
+  const auto resources = runner.ResourceClaim();
+  if (!resources.state_capacity_bytes.has_value() ||
+      !resources.per_request_state_bytes.has_value())
+    return 1;
+  const std::size_t per_request = *resources.per_request_state_bytes +
+                                  resources.temporary_scratch_bytes.value_or(0);
+  if (per_request == 0)
+    return 1;
+  // Leave room for allocations that follow session creation: cache backing,
+  // transfer streams and allocator fragmentation. The measured base state is
+  // close to the allocation that follows; without a reserve the last sessions
+  // fit arithmetically but cannot be allocated on a nearly full APU.
+  constexpr std::size_t kMinimumReserveBytes = std::size_t{4} << 30;
+  constexpr std::size_t kReserveThresholdBytes = std::size_t{1} << 30;
+  const std::size_t capacity = *resources.state_capacity_bytes;
+  const std::size_t reserve = capacity > kReserveThresholdBytes
+                                  ? std::max(kMinimumReserveBytes, capacity / 4)
+                                  : 0;
+  if (capacity <= reserve)
+    return 1;
+  const std::size_t fit = (capacity - reserve) / per_request;
+  // Do not cap at the widest execution plan: a paged runner can keep more
+  // sessions resident than one physical pass and serve them in later waves.
+  return std::clamp<std::size_t>(fit, 1, std::max<std::size_t>(1, ceiling));
 }
 
 ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
@@ -561,6 +590,11 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
 }
 
 }  // namespace
+
+std::size_t AutoSessionCount(const TextModelRunner& runner,
+                             std::size_t ceiling) {
+  return FitAutoSessionCount(runner, ceiling);
+}
 
 void TextModelRunner::AdvanceBatch(
     std::span<const TextRunnerAdvance> advances) const {
@@ -1698,10 +1732,12 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
 bool TextRunnerPool::Request::CanBatchPrefill() const {
   if (!*this || !impl_)
     return false;
-  // Opt-in: the cohort path shares the expert weight read but does not yet
-  // reproduce the serial frontier tokens, so the qualified per-request path
-  // stays the default.
-  if (std::getenv("GUFO_BATCHED_PREFILL") == nullptr)
+  // Automatic: the cohort shares the expert weight read and reproduces the
+  // serial frontier arithmetic. GUFO_BATCHED_PREFILL=0 is a diagnostics kill
+  // switch for matched serial A/B runs; it is never required to enable
+  // batching.
+  if (const char* disabled = std::getenv("GUFO_BATCHED_PREFILL");
+      disabled != nullptr && disabled[0] == '0' && disabled[1] == '\0')
     return false;
   if (impl_->decode_ready || impl_->stopped ||
       impl_->pending_selection.has_value())
@@ -1725,15 +1761,25 @@ std::vector<TextPrefillStep> TextRunnerPool::Request::PrefillBatch(
       throw std::logic_error("peer is not eligible for a batched prefill");
     }
   }
+  // The serial path stops on the stable-prefix boundary so it can retain a
+  // continuation snapshot there. The split also fixes the frontier pass's row
+  // count, so a batched pass must use the same boundary to reproduce the
+  // serial frontier arithmetic.
+  const auto chunk_limit = [&](const Impl& target) {
+    auto limit = std::min(max_input_tokens,
+                          target.prompt.size() - target.prefill_offset);
+    if (target.prefill_offset < target.snapshot_tokens.size() &&
+        target.snapshot_tokens.size() < target.prompt.size()) {
+      limit = std::min(limit,
+                       target.snapshot_tokens.size() - target.prefill_offset);
+    }
+    return limit;
+  };
   // Prepare every lease before the pass, as the single-request path does: the
   // hook reserves the prefill scratch for the tokens this chunk will consume.
-  impl_->lease.PreparePrefill(
-      std::min(impl_->prompt.size() - impl_->prefill_offset, max_input_tokens));
-  for (Request* peer : peers) {
-    peer->impl_->lease.PreparePrefill(std::min(
-        peer->impl_->prompt.size() - peer->impl_->prefill_offset,
-        max_input_tokens));
-  }
+  impl_->lease.PreparePrefill(chunk_limit(*impl_));
+  for (Request* peer : peers)
+    peer->impl_->lease.PreparePrefill(chunk_limit(*peer->impl_));
   // The runner pass carries this request first, then its peers in order.
   std::vector<TextPrefillBatchItem> items;
   items.reserve(peers.size() + 1);
@@ -1741,14 +1787,14 @@ std::vector<TextPrefillStep> TextRunnerPool::Request::PrefillBatch(
       &dynamic_cast<TextRunnerState&>(impl_->lease.state()),
       std::span<const TextRunnerToken>(impl_->prompt),
       impl_->prefill_offset,
-      max_input_tokens,
+      chunk_limit(*impl_),
   });
   for (Request* peer : peers) {
     items.push_back({
         &dynamic_cast<TextRunnerState&>(peer->impl_->lease.state()),
         std::span<const TextRunnerToken>(peer->impl_->prompt),
         peer->impl_->prefill_offset,
-        max_input_tokens,
+        chunk_limit(*peer->impl_),
     });
   }
   auto steps = impl_->runner->PrefillBatch(items);
@@ -1759,7 +1805,8 @@ std::vector<TextPrefillStep> TextRunnerPool::Request::PrefillBatch(
     Impl& target = i == 0 ? *impl_ : *peers[i - 1]->impl_;
     const auto remaining = target.prompt.size() - target.prefill_offset;
     if (steps[i].interrupted || steps[i].consumed_tokens == 0 ||
-        steps[i].consumed_tokens > std::min(remaining, max_input_tokens)) {
+        steps[i].consumed_tokens >
+            std::min(remaining, items[i].max_input_tokens)) {
       throw std::runtime_error(
           "text runner returned an invalid batched prefill token count");
     }
@@ -1821,10 +1868,11 @@ void TextRunnerPool::Request::Advance() {
     throw std::logic_error(
         "text runner request has no selected token to advance");
   }
+  const auto token = impl_->pending_selection->token;
   impl_->CapturePromptSnapshot();
   impl_->state_reusable = false;
   impl_->runner->Advance(dynamic_cast<TextRunnerState&>(impl_->lease.state()),
-                         impl_->pending_selection->token);
+                         token);
   impl_->pending_selection.reset();
   impl_->state_reusable = true;
 }

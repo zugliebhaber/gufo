@@ -22,7 +22,13 @@ gufo prompt --model MODEL -p "Explain paged KV cache" -n 256 -t 0 --think off
 gufo chat --model MODEL
 
 # OpenAI-compatible server (throughput point)
-gufo serve --host 0.0.0.0 --port 8080 --sessions 32   llm --model MODEL --context 1024 --prefill-chunk 16384   --cache-ram-bytes off
+gufo serve --host 0.0.0.0 --port 8080 --sessions 32 \
+  llm --model MODEL --context 1024 --prefill-chunk 16384 \
+  --cache-ram-bytes off
+
+# dynamic session count for long-context or mixed load; never fail on VRAM
+gufo serve --host 0.0.0.0 --port 8080 --sessions auto \
+  llm --model MODEL --context 250000
 
 # direct model benchmark (prompt 336, generate 128)
 gufo bench --model MODEL -p 336 -n 128
@@ -35,6 +41,11 @@ gufo diagnose
 quickstart](../README.md#quickstart) has the container and native recipes; the
 [architecture](ARCHITECTURE.md) explains the request flow.
 
+Order matters: use `gufo serve [server options] llm [llm options]`. Shared
+server options such as `--host`, `--port` and `--sessions` may precede `llm`;
+model options such as `--model`, `--context`, `--prefill-chunk` and
+`--speculative` must follow it.
+
 ### Config names and CLI flags
 
 The feature list below uses the conceptual/config names (for example
@@ -46,8 +57,10 @@ The feature list below uses the conceptual/config names (for example
 | `prefillChunk` | `--prefill-chunk` |
 | `maxTokens` | `--max-tokens` |
 | `servedModelName` | `--served-model-name` |
-| `sessions` | `--sessions` |
+| `sessions` | `--sessions N\|auto` |
 | `cacheRam` budget | `--cache-ram-bytes` |
+| `cacheRetainCold` | `--cache-retain-cold` |
+| `kvPoolBytes` | `--kv-pool-bytes N\|off` |
 | `cacheDisk`, `cacheDiskBytes`, `cacheDiskStagingBytes` | `--cache-disk`, `--cache-disk-bytes`, `--cache-disk-staging-bytes` |
 | `maxPending`, `maxPendingPerClient` | `--max-pending`, `--max-pending-per-client` |
 | `requestTimeoutMs`, `stallTimeoutMs` | `--request-timeout-ms`, `--stall-timeout-ms` |
@@ -72,6 +85,11 @@ The feature list below uses the conceptual/config names (for example
   tok/s (+26.7%) and TTFT from 13.87 s to 0.223 s, while the physical-token
   total fell because cached prefill is logged as zero. Report output/TTFT for
   cached workloads. Details: [Flash-Next benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md).
+- **Cold retention** is opt-in: `--cache-retain-cold` keeps snapshots for
+  unique single-turn prompts. Without it, a prompt is retained only when there
+  is evidence of reuse (a hit, a waiting peer sharing the prefix, or a
+  repeated/extended prompt), so one-off traffic cannot fill the RAM ledger.
+  See [retention gating](FEATURES.md#retention-gating-for-coldunique-traffic).
 
 ## Functionalities
 
@@ -268,15 +286,25 @@ These apply to every modality, before or after the subcommand:
 - `host` / `port` — where to listen (`-i` / `-p`). In practice: set
   `--host 0.0.0.0` if you serve from inside a container, or the published
   port will not answer. Use `--host ::` to listen on IPv6 and IPv4 together.
-- `sessions` (`-j`) — preallocated GPU request sessions. In practice: more
-  sessions means more requests can compute at once, at the cost of memory
+- `sessions` (`-j N|auto`) — preallocated GPU request sessions. In practice:
+  more sessions means more requests can compute at once, at the cost of memory
   per session. A model executes ready decoders in waves of its own batch
-  width, so the pool can exceed it: Qwen3.8 Flash-Next serves up to 32 rows
-  per decode pass, Qwen3.8 27B and DeepSeek V4 Flash eight. This option
-  applies to LLM serving; image and speech servers use their own bounded
-  queues. The embedding server packs waiting text requests
-  into shared device batches and runs each request with images in its own
-  batch. `--max-connections` bounds the waiting requests.
+  width, so the pool can exceed it: Qwen3.8 Flash-Next serves up to 256 rows
+  per decode pass (hybrid plan selected by the resident cohort), Qwen3.8 27B
+  and DeepSeek V4 Flash eight. `auto` resolves the
+  pool after model load from the measured per-session **base state**, not the
+  full context: at 250k Qwen3.8 Flash-Next resolves to 96 sessions on this
+  host, and 128k resolves to 150. It starts with one resident session, grows
+  toward queued demand, and returns to one when idle. Admission charges each
+  request's prompt plus requested output against the shared KV pool; a request
+  that does not fit stays queued and retries. Requests blocked by VRAM are
+  deferred and retried instead of failed; only client cancellation or a real
+  model error ends them. See the
+  [auto sessions contract](SERVER.md#auto-sessions). This option applies to LLM
+  serving; image and speech servers use their own bounded queues. The embedding
+  server packs waiting text requests into shared device batches and runs each
+  request with images in its own batch. `--max-connections` bounds the waiting
+  requests.
 - `maxConnections` — maximum simultaneous HTTP connections. In practice:
   clients beyond the limit queue or are refused instead of piling up. A
   connection stops counting once its response is fully written, so a client

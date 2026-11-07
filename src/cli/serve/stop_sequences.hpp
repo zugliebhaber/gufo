@@ -79,7 +79,9 @@ public:
   [[nodiscard]] bool enabled() const noexcept { return !sequences_.empty(); }
   [[nodiscard]] bool stopped() const noexcept { return match_.has_value(); }
   [[nodiscard]] const std::string& matched_sequence() const {
-    return sequences_.at(match_.value());
+    if (!match_)
+      throw std::logic_error("stop sequence filter has no match");
+    return sequences_.at(*match_);
   }
 
   std::string Push(std::string_view piece) {

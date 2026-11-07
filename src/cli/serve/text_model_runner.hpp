@@ -187,6 +187,12 @@ struct TextRunnerResourceClaim {
   /// Most an explicit RAM-cache limit may claim. Missing means the automatic
   /// retained_snapshot_capacity_bytes is also the ceiling.
   std::optional<std::size_t> retained_snapshot_ceiling_bytes;
+  /// Shared paged-KV pool in tokens. `free` is a live snapshot: admission
+  /// revalidates it before every new resident, so the session pool can exceed
+  /// the number of full contexts the pool would hold at once.
+  std::optional<std::size_t> shared_kv_capacity_tokens;
+  std::optional<std::size_t> shared_kv_free_tokens;
+  std::optional<std::size_t> shared_kv_block_tokens;
   bool requires_device_runtime_lock{false};
 };
 
@@ -194,6 +200,19 @@ struct TextRunnerMeasuredResources {
   std::optional<std::size_t> per_request_state_bytes;
   std::optional<std::size_t> temporary_scratch_bytes;
 };
+
+class TextModelRunner;
+
+/// Largest session count whose aggregate base-state claim fits in the
+/// runner's measured free state capacity. A paged model reports only the state
+/// each session owns (block table, index and recurrent state), not the shared
+/// KV rows, so this count grows with real per-session state instead of
+/// `max_context`. The execution plan still selects the physical decode width;
+/// a wider pool serves additional sessions in later waves.
+/// A requested count of zero means auto: resolve it immediately after the
+/// model is resident but before the pool allocates request states.
+[[nodiscard]] std::size_t AutoSessionCount(const TextModelRunner& runner,
+                                           std::size_t ceiling = 256);
 
 struct TextPrefillStep {
   std::size_t consumed_tokens{0};

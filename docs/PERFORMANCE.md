@@ -268,6 +268,16 @@ Measure reuse separately:
   32-identical batch measured 44.410 -> 4.891 s (9.08x) and 4096 identical
   output tokens. The canonical unique-nonce table on/off difference was
   +0.43% to +0.91% (noise; no group forms).
+- **Long-context auto sessions:** run with `--sessions auto --context 250000`
+  and the canonical unique-nonce prompts. The pool resolves from measured
+  **base state** capacity, not full context (96 sessions at 250k and 150 at
+  128k on this host), grows with queued demand, and admits each request only
+  when its prompt plus requested output fits the shared KV pool. Requests that
+  do not fit wait and retry instead of failing. Report aggregate PP/TG plus
+  queue and TTFT at the requested concurrency: above the decode knee extra
+  clients only queue. The retained 128k sweep, the new 250k run and the MTP A/B
+  are in [the Flash-Next
+  benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md#auto-sessions-at-250k-2026-11-06).
 
 The fresh 8/16/24/32 table and both A/Bs are in
 [the Flash-Next benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md) and
@@ -522,3 +532,9 @@ A performance change is retained only when:
 Document the winning route, current measurements, reproduction command, and
 remaining gap. Keep rejected alternatives to a short summary or the relevant
 issue discussion.
+
+For the ranked 52-measure 1000-request batch catalogue — prefill cohorts, prefix-cache
+boundaries, prefill/decode overlap, wide decode plans, MTP and operational
+levers — see [batch throughput levers](BATCH-THROUGHPUT.md). Keep the measured
+and estimated entries separate; do not promote an experiment to a default
+without the 1024-request A/B and the declared correctness oracle.

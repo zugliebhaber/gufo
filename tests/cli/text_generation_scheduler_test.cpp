@@ -222,6 +222,12 @@ struct FakeControl {
   /// Resource claim used to size the fake runner's state pool.
   std::size_t state_capacity_bytes{8 * 64};
   std::size_t per_request_state_bytes{64};
+  /// Optional shared paged-KV pool. Tests mutate `free` to simulate blocks
+  /// becoming available after a resident completes.
+  bool shared_kv{false};
+  std::size_t shared_kv_capacity_tokens{0};
+  std::atomic<std::size_t> shared_kv_free_tokens{0};
+  std::size_t shared_kv_block_tokens{1};
   std::optional<std::size_t> stop_after;
   std::optional<std::size_t> eos_after;
   std::function<void()> snapshot_callback;
@@ -303,6 +309,19 @@ public:
         .temporary_scratch_bytes = 0,
         .retained_snapshot_capacity_bytes =
             control_->snapshot_callback ? 4096U : 0U,
+        .shared_kv_capacity_tokens =
+            control_->shared_kv ? std::optional<std::size_t>(
+                                      control_->shared_kv_capacity_tokens)
+                                : std::nullopt,
+        .shared_kv_free_tokens = control_->shared_kv
+                                     ? std::optional<std::size_t>(
+                                           control_->shared_kv_free_tokens.load(
+                                               std::memory_order_relaxed))
+                                     : std::nullopt,
+        .shared_kv_block_tokens =
+            control_->shared_kv
+                ? std::optional<std::size_t>(control_->shared_kv_block_tokens)
+                : std::nullopt,
         .requires_device_runtime_lock = true,
     };
   }
@@ -3239,6 +3258,116 @@ void TestKvExhaustionDegradesInsteadOfFailing() {
          "degradation balances the processing and deferred gauges");
 }
 
+// Auto sessions start at one resident, grow while demand queues, and return to
+// one after the queue drains. The fixed-mode bound would already be the full
+// pool, so this test distinguishes the dynamic policy from a static one.
+void TestAutoSessionsGrowWithDemandAndReturnToIdle() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_prefill_label = 1;
+  auto scheduler =
+      MakeScheduler(control, 4, {}, TextSchedulerPolicy{.auto_sessions = true});
+  Expect(scheduler->max_num_seqs() == 1,
+         "auto sessions start with one resident");
+  auto first = scheduler->Submit({1, 11}, 2, 0.0F);
+  control->WaitForPrefill(1);
+  std::vector<TextGenerationScheduler::Request> requests;
+  requests.reserve(3);
+  for (TextRunnerToken label = 2; label <= 4; ++label)
+    requests.push_back(scheduler->Submit({label, label + 10}, 2, 0.0F));
+  control->ReleasePrefill();
+  std::size_t widest = first.Wait().resident_requests_at_admission;
+  for (auto& request : requests)
+    widest = std::max(widest, request.Wait().resident_requests_at_admission);
+  Expect(widest >= 2,
+         "auto sessions grow beyond one while requests are queued");
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (scheduler->max_num_seqs() != 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  Expect(scheduler->max_num_seqs() == 1,
+         "auto sessions return to one when the queue is idle");
+  Expect(gufo::server::detail::RequestsProcessing().load() == 0 &&
+             gufo::server::detail::RequestsDeferred().load() == 0,
+         "auto scaling balances the processing and deferred gauges");
+}
+
+// Auto mode must defer a KV shortage even when no other resident holds blocks:
+// the request releases its device state, retries from its retained host
+// snapshot, and completes. Fixed mode fails this case.
+void TestAutoSessionsDeferKvExhaustionWithoutResident() {
+  auto control = std::make_shared<FakeControl>();
+  control->prefill_capacity = 8;
+  control->partial_prefill_retention = true;
+  control->prefill_rollback = true;
+  control->throw_prefill_kv_exhausted_label = 2;
+  control->throw_prefill_kv_exhausted_after = 8;
+  // The 10 ms request deadline would abort the retry unless auto mode pauses
+  // it while the request is deferred for KV.
+  auto scheduler = MakeScheduler(
+      control, 2, {},
+      TextSchedulerPolicy{.request_timeout = std::chrono::milliseconds{10},
+                          .auto_sessions = true},
+      gufo::server::TextRunnerRamCacheOptions{.retain_cold = true});
+  std::vector<TextRunnerToken> long_prompt{2};
+  for (std::size_t index = 0; index < 16; ++index)
+    long_prompt.push_back(2200 + static_cast<TextRunnerToken>(index));
+  const auto result = scheduler->Submit(long_prompt, 4, 0.0F).Wait();
+  Expect(!result.cancelled && result.tokens == ExpectedTokens(2, 4),
+         "auto mode defers and resumes without a resident holder");
+  Expect(result.kv_deferrals >= 1, "the deferred request reports its KV retry");
+  Expect(gufo::server::detail::TotalKvDeferrals().load() >= 1,
+         "the process-wide degradation counter reports the event");
+  Expect(gufo::server::detail::RequestsProcessing().load() == 0 &&
+             gufo::server::detail::RequestsDeferred().load() == 0,
+         "auto degradation balances the processing and deferred gauges");
+}
+
+// A shared paged-KV pool admits only requests whose prompt plus requested
+// output fits beside the resident batch. The blocked arrival keeps its queue
+// position and resumes when blocks become free; it is never failed.
+void TestAutoSessionsAdmitOnlyWhatFitsSharedKv() {
+  namespace metrics = gufo::server::detail;
+  const auto processing_before = metrics::RequestsProcessing().load();
+  const auto deferred_before = metrics::RequestsDeferred().load();
+  auto control = std::make_shared<FakeControl>();
+  control->shared_kv = true;
+  control->shared_kv_capacity_tokens = 64;
+  control->shared_kv_free_tokens.store(6);
+  control->shared_kv_block_tokens = 1;
+  control->block_prefill_label = 1;
+  auto scheduler =
+      MakeScheduler(control, 4, {}, TextSchedulerPolicy{.auto_sessions = true});
+
+  auto first = scheduler->Submit({1, 11}, 2, 0.0F);
+  control->WaitForPrefill(1);
+  auto second = scheduler->Submit({2, 22, 23}, 2, 0.0F);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (std::chrono::steady_clock::now() < deadline &&
+         metrics::RequestsProcessing().load() == processing_before + 1) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  Expect(metrics::RequestsProcessing().load() - processing_before == 1,
+         "the shared-KV-bound request stays out of the resident batch");
+  Expect(metrics::RequestsDeferred().load() - deferred_before == 1,
+         "the blocked request keeps its queue slot");
+
+  // The resident releases its reservation, as a completed prefill would.
+  control->shared_kv_free_tokens.store(64);
+  control->ReleasePrefill();
+  const auto first_result = first.Wait();
+  const auto second_result = second.Wait();
+  Expect(first_result.tokens == ExpectedTokens(1, 2),
+         "the resident request completes");
+  Expect(second_result.tokens == ExpectedTokens(2, 2),
+         "the deferred request resumes without a failure");
+  Expect(metrics::RequestsProcessing().load() == processing_before &&
+             metrics::RequestsDeferred().load() == deferred_before,
+         "shared-KV admission leaves no request behind");
+}
+
 // TP-P1: the bound is a real scheduling input, not a hint.
 void TestMaxNumSeqsBoundsAreValidated() {
   auto control = std::make_shared<FakeControl>();
@@ -3589,6 +3718,9 @@ int main() {
   TestLargeBatchAdmitsEveryArrival();
   TestBatchShrinkRecomputesRunningRequests();
   TestKvExhaustionDegradesInsteadOfFailing();
+  TestAutoSessionsGrowWithDemandAndReturnToIdle();
+  TestAutoSessionsDeferKvExhaustionWithoutResident();
+  TestAutoSessionsAdmitOnlyWhatFitsSharedKv();
   TestMaxNumSeqsBoundsAreValidated();
   TestPendingLimitsRejectBeforeStateAdmission();
   TestPendingClientsAreRoundRobinAndIndividuallyBounded();

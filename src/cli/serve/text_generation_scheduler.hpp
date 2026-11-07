@@ -101,6 +101,16 @@ struct TextSchedulerPolicy {
   /// disables it.
   std::chrono::milliseconds stall_timeout{0};
   bool log_progress{false};
+  /// Starts the resident bound at one and grows it with queued demand while
+  /// memory headroom allows. Memory-blocked requests are deferred
+  /// indefinitely instead of being failed.
+  bool auto_sessions{false};
+  /// Fill the decode cohort to this many residents before running a decode
+  /// wave. Auto sessions default this to the resolved pool capacity so the
+  /// hybrid plan can use the widest cohort; zero keeps the qualified
+  /// interleaving for fixed-session servers unless the environment overrides
+  /// it.
+  std::size_t assemble_decode_rows{0};
 };
 
 /// Single-owner scheduler for opaque text-model runner states.

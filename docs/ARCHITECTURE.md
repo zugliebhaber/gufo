@@ -129,8 +129,13 @@ flowchart TB
 - **Decode** advances every resident session by one target token. The physical
   width is a plan (1..N); a wider plan amortises the expert read over more
   sessions but reduces per-request latency. For Qwen3.8 Flash-Next the
-  scheduler advertises 2..32 rows; width 32 is the throughput point, width 1
-  the latency point.
+  scheduler advertises 2..256 rows and picks the widest plan the resident
+  cohort can fill; 32 is the retained control point, 256 the best measured
+  wide-batch point, and width 1 the latency point. Wide Q8 projections (the
+  attention/SSM QKV and output projections, plus the vocabulary head) use the
+  W8A8/F16 Dense route above 48 rows, so each weight block is read once per
+  wider activation tile instead of once per 32 rows; rows up to 48 keep the
+  MMVQ q8_1 tiles.
 - **Verification / speculative decoding** adds a draft chain: the target
   verifies several rows in one forward pass, then commits the accepted prefix.
   Greedy verification must reproduce the autoregressive tokens; sampled
@@ -153,7 +158,8 @@ flowchart LR
     EP --> OUT["Next residual"]
 
     GU -. prefill .-> TILED["Tiled F16 / WMMA<br/>16/64/128-row tiles"]
-    GU -. decode .-> VEC["Grouped vector kernel<br/>wave64, 2 output rows per block"]
+    GU -. decode tails .-> VEC["Grouped vector kernel<br/>wave64, 2 output rows per block"]
+    GU -. wide decode .-> WIDE["Compacted expert buckets<br/>64/128-row tiles"]
 ```
 
 Two expert GEMMs exist for a reason:
@@ -161,11 +167,16 @@ Two expert GEMMs exist for a reason:
 - **Prefill** has many rows per expert, so the tiled F16/WMMA path amortises
   dequantisation over a 16-row tile. Padding is acceptable because there is
   enough work per tile.
-- **Decode** has roughly one to a few rows per expert; the vector path avoids
-  padding and reuses each weight fragment across all slots of an expert. At
-  c32 the measured expert union is ~113 of 512, gate/up reaches ~198 GB/s and
-  down ~174 GB/s DRAM plus L2 reuse; the expert path is close to the memory
-  ceiling, not a cheap kernel-tuning target.
+- **Decode** has two routes. Narrow tails (up to 32 rows) use the grouped
+  vector kernel, which avoids padding and reuses each weight fragment across
+  the slots of an expert. Wide plans (>32 rows) delegate to `Moe`: the routed
+  assignments are compacted into expert buckets and read with the 64-row down
+  and 128-row gate/up tiles. This matters because routing can concentrate on a
+  few experts: with all 256 rows on the same ten experts, the vector route
+  re-read each hot expert once per eight-token group, while the compacted route
+  reads it once per bucket. The wide route took 1024x16 from 210.2 to 177.0 s
+  and 256x128 from 103.5 to 81.0 s (2x2 A/B, 256/256 exact); the wider tiles
+  added another ~1 % at 1024x16.
 
 The shared expert is a dense gate/up/down pair. It is processed in eight-row
 chunks on decode and can overlap the routed experts on the side stream for
@@ -198,6 +209,9 @@ flowchart TB
     KV --> OUT["Responses"]
 ```
 
+The block-level implementation is diagrammed in the [visual KV cache and
+pagination guide](KV-CACHE-VISUAL.md).
+
 The design separates three reuse tiers:
 
 1. **Live session state** — a resident session keeps its KV/recurrent state;
@@ -212,7 +226,11 @@ The default RAM budget is `0` = auto (half of free RAM, up to 32 GiB); `off`
 disables retained checkpoints but keeps each session's live state. The
 canonical serving benchmark runs with `off` to measure cold compute. A
 shared-prefix workload (or a repeated conversation) benefits from the default
-cache; see `docs/KV-CACHE.md` and `docs/cache-redesign/RFC.md`.
+cache; see `docs/KV-CACHE.md` and `docs/cache-redesign/RFC.md`. Cold, unique
+single-turn prompts are not retained unless `--cache-retain-cold` opts in, so
+one-off traffic cannot fill the RAM ledger. Flash-Next keeps the recurrent
+state of its linear layers in BF16 (the recurrence itself runs in F32), which
+halves the per-session state next to KV.
 
 ## 6. Request coalescing
 
@@ -302,28 +320,41 @@ all sessions. A model crash takes the process down, so the stall watchdog and
 decode amortises the same read over the batch. Wider batches improve aggregate
 decode but hurt per-request latency.
 
-**Decision.** Prefill runs one pass at a time (a cohort may share it only in the
-opt-in, non-bit-identical path). Decode plans are explicit widths; Flash-Next
-advertises 2..32 rows and uses 32 for throughput. Width 32 is one physical pass,
-not two 16-row waves.
+**Decision.** Prefill runs one pass at a time; several cold prompts share it in
+the default cohort, whose stable-prefix chunk boundary passes the deterministic
+256/256 gate at cohort 8/16/32 (`GUFO_BATCHED_PREFILL=0` is a diagnostics kill
+switch). Decode plans are explicit widths; Flash-Next advertises 2..256 rows.
+Auto sessions fill the decode cohort up to the resolved session count, so the
+plan scales with the pool: 96 rows at 250k, 150 at 128k, 256 at short context.
+Wide decode plans (>32 rows) use the compacted expert buckets; narrow tails keep
+the grouped vector path. Width 32 remains the retained cold canonical control.
 
 **Consequences.** The canonical c32 table is the throughput reference; c24
-keeps more per-request rate. A two-wave 64-session setup is not a 64-row pass
-and repeats the expert read; it was measured at <2% gain.
+keeps more per-request rate. At 1024 concurrent requests with 32 output tokens,
+256 rows measured 61.0 tok/s aggregate TG / 533.8 s against 56.8 tok/s / 574.0 s
+for 32 rows (+7.4 % TG). A 16-output prefill-bound run was neutral (37.5 vs
+37.4 tok/s); the gain is decode-workload dependent. Greedy token parity against
+32 rows held for 256 deterministic prompts.
 
-### ADR-3: Tiled F16/WMMA for prefill, grouped vector kernel for decode
+### ADR-3: Tiled expert GEMMs for prefill and wide decode, vector groups for tails
 
 **Context.** Dequantising every weight element for one or two rows is wasteful;
-padding a two-row bucket into a 16-row tile is also wasteful.
+padding a two-row bucket into a 16-row tile is also wasteful. But a wide decode
+plan can route hundreds of rows to the same hot expert, where eight-token
+vector groups re-read the expert's weights many times.
 
-**Decision.** Keep both paths: tiled F16/WMMA for multi-row prefill, grouped
-vector (wave64, weight reuse across expert slots) for decode. The prefill path
-also prefetches one stage ahead and pairs gate/up with SwiGLU.
+**Decision.** Keep both paths. Tiled F16/WMMA handles multi-row prefill. Decode
+uses grouped vector kernels for narrow tails and delegates wide plans (>32
+rows) to the compacted expert buckets (`Moe`), with 64-row down and 128-row
+gate/up tiles. The prefill path also prefetches one stage ahead and pairs
+gate/up with SwiGLU.
 
-**Consequences.** The decode expert kernel is close to the DRAM ceiling (measured
-~198 GB/s gate/up, ~174 GB/s down plus L2), so ILP/block-granularity changes were
-negative. The remaining expert-side headroom is a few percent; major gains need
-a different memory budget (quantisation) or sharing (coalescing/cache).
+**Consequences.** The compacted route is the largest measured decode lever on
+Flash-Next: 1024x16 improved from 210.2 to 177.0 s and 256x128 from 103.5 to
+81.0 s (2x2 A/B), and the wide tiles added a further ~1 % at 1024x16. Narrow
+tails keep the vector path because compaction would add work without weight
+reuse. The remaining headroom is the recurrent-state traffic and the dense
+trunk, not the routed expert read.
 
 ### ADR-4: Keep cold and shared-prefix measurements separate
 
@@ -384,16 +415,50 @@ hardware ceilings.
 profile write still needs host root; the runbook records the honest `auto`
 baseline when it cannot be pinned.
 
+### ADR-8: Auto sessions grow with demand and never fail on VRAM exhaustion
+
+**Context.** A fixed session count forces the operator to choose between
+latency and aggregate throughput before the workload is known. Long-context
+servers cannot simply raise the count if every session reserves a full context:
+that charges the maximum KV for every conversation, including the short ones
+that dominate real traffic. A request that loses the KV race must not be
+dropped.
+
+**Decision.** `--sessions auto` resolves the pool after model load from the
+runner's measured state capacity, divided by the per-session **base state**
+(block table, index and recurrent state) and a 25 % reserve for cache backing,
+transfer streams and allocator fragmentation. The shared paged-KV rows are not
+charged per session. The count is not capped by the widest execution plan; a
+wider pool serves additional sessions in later decode waves. Admission charges
+each request's prompt plus its requested output budget against the shared pool's
+free blocks and outstanding reservations; a request that does not fit stays
+queued and retries after 20 ms. The scheduler starts at one resident session
+and grows toward visible demand. In auto mode, KV exhaustion defers a request
+with its retained host snapshot and retries it; the fixed-mode deferral limit,
+snapshot-pending refusal and patience timeout do not apply. Auto servers
+disable device-row lending for prefix-cache checkpoints so completed requests
+cannot pin pool blocks.
+
+**Consequences.** A single-user server stays at one session; a burst expands to
+the memory-and-demand limit and contracts when idle. On this host Flash-Next
+resolves to 150 sessions at 128k and 96 at 250k, so the hybrid plan reaches
+150 or 96 rows instead of the former 32-row control. The effective count
+appears as `sessions=auto(N)` and `event=auto_sessions`. The trade-off is bounded latency: a request that exceeds
+the current free KV waits for residents to release blocks instead of returning
+an error. Queue-full admission (`--max-pending`) and non-KV errors still fail
+fast. Non-text modalities keep their own fixed queues.
+
 ## 9. Invariants and limits
 
 - The model's weights are resident once; a second server for the same model
   duplicates them. Two Flash-Next servers do not fit in 128 GiB.
 - A scheduler decision is made on one thread; don't add blocking GPU calls to
   plan selection.
-- Prefill is one pass at a time; a cohort must be opt-in and is not
-  bit-identical to serial prefill in the current implementation.
+- Prefill is one pass at a time. The default cohort uses a stable-prefix chunk
+  boundary and passes the deterministic 256/256 gate at cohort 8/16/32;
+  `GUFO_BATCHED_PREFILL=0` is a diagnostics kill switch.
 - A decode plan width is physical rows, not request count. Two 16-row waves are
-  not a 32-row plan.
+  not a 32-row plan, and two 128-row waves are not a 256-row plan.
 - Any cache hit, coalesced follower or shared prefill must be reported with its
   workload label; physical-token totals can decrease while output/wall
   improves.

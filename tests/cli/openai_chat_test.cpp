@@ -2373,19 +2373,23 @@ void TestConflictingReasoningControlsAreRejected() {
          "Invalid reasoning request never reaches generation");
 }
 
-void TestWrongModelIsRejected() {
+void TestUnknownModelUsesLoadedModel() {
   FakeBackend backend;
+  backend.pieces = {"ok"};
   const auto response = gufo::server::HandleOpenAiChat(Request(R"({
         "model":"wrong-model",
         "messages":[{"role":"user","content":"hello"}]
       })"),
                                                        backend);
 
-  Expect(response.status == 404, "Unknown model is rejected");
-  Expect(response.body.find("model_not_found") != std::string::npos,
-         "Unknown model returns a stable error code");
-  Expect(backend.chat_calls.load() == 0,
-         "Rejected request never reaches the backend");
+  Expect(response.status == 200,
+         "Unknown model name is served by the loaded model");
+  Expect(backend.chat_calls.load() == 1,
+         "Unknown model request reaches the backend");
+  Expect(response.body.find(R"("model":"test-model")") != std::string::npos,
+         "Response names the loaded model, not the unknown request name");
+  Expect(response.body.find("model_not_found") == std::string::npos,
+         "Unknown model no longer returns model_not_found");
 }
 
 void TestServedModelNamesAreEchoed() {
@@ -2416,9 +2420,10 @@ void TestServedModelNamesAreEchoed() {
       Request(
           R"({"model":"additional","messages":[{"role":"user","content":"hi"}]})"),
       backend);
-  Expect(response.status == 404 &&
-             response.body.find("model_not_found") != std::string::npos,
-         "A single served name accepts nothing else");
+  Expect(response.status == 200,
+         "A previously served but now unknown name still reaches the model");
+  Expect(response.body.find(R"("model":"test-model")") != std::string::npos,
+         "An unknown name resolves to the primary served name");
 }
 
 void TestClientIdentityReachesBackend() {
@@ -6925,7 +6930,7 @@ int main() {
   TestDeepSeekRepeatedToolParameters();
   TestDeepSeekSchemaCheckedArguments();
   TestStreamingStopsAtRejectedParameter();
-  TestWrongModelIsRejected();
+  TestUnknownModelUsesLoadedModel();
   TestServedModelNamesAreEchoed();
   TestClientIdentityReachesBackend();
   TestStreamingOverloadIsRejectedBeforeHeaders();

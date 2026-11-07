@@ -83,9 +83,18 @@ adaptation floor under pressure.
 
 One prefill pass runs at a time, and a pass costs a fixed full expert-weight
 read plus a per-token part, so short prompts spend most of the pass on that
-fixed cost. An experimental, off-by-default pairing
-(`GUFO_BATCHED_PREFILL=1`) puts two cold prompts into one pass to share the
-read; it is not bit-identical to serial prefill and stays opt-in.
+fixed cost. Cold prompts are batched automatically: a cohort shares one pass,
+its cap is 32, and the actual size is `min(32, prefilling queue depth)`. It
+reproduces the serial stable-prefix chunking: a deterministic 256-prompt check
+matches serial 256/256 for cohort 8, 16 and 32, and at 1024×16 the automatic
+cohort improves wall time from 416.3 s to 214.4 s (TG 39.4 → 76.4 tok/s, PP
+233.5 → 453.3 tok/s). Cohort prefill also synchronizes decode waves: at
+1024×32 the decode batch grows from ~31 to 256 rows and aggregate TG rises
+from 56.6 to 99.9 tok/s, while per-stream decode speed falls. Prefix-cache
+checkpoints from a batched prefill are not
+yet restored by the component cache, so repeated prefixes in a cache-on
+deployment may re-prefill; the 1024 measurements use cache off. See
+[batch throughput levers](BATCH-THROUGHPUT.md#baseline-and-where-the-time-goes).
 
 KV and prefill work draw from the same unified memory as the weights, so the
 scheduler reads the host's free RAM (after cgroup limits) with a 2 GiB reserve.
@@ -104,9 +113,6 @@ the larger of 16 and `--sessions`, so a burst as wide as the batch is queued
 instead of refused (`--max-pending 0` keeps that automatic bound). A model
 executes ready decoders in waves of its own batch width, so a pool wider than
 that width still admits and serves every session; unified memory, not the
-scheduler, is the real limit.
-
-that width still admits and serves every session; unified memory, not the
 scheduler, is the real limit. Requests beyond the admitted batch wait for a
 session; none is ever swapped out. When the admitted batch has to shrink, the
 scheduler uses RECOMPUTE preemption: the newest residents release their model
@@ -117,16 +123,87 @@ reclaimed for the remaining batch instead of being parked in host memory. The
 [knee sweep](../tools/gufo/serving_sweep.py) measures where a wider batch stops
 paying for itself.
 
+### Auto sessions
+
+`--sessions auto` (or `-j auto`) sizes the text session pool after the model is
+resident instead of at startup. Gufo divides the runner's measured free state
+capacity by the per-session **base state** (KV block table, index and recurrent
+state; the shared KV rows are not charged again) and keeps a 25 % reserve for
+cache backing, transfer streams and allocator fragmentation. It does not cap
+the pool at the widest execution plan: a wider pool serves additional sessions
+in later decode waves. The resolved count is logged at startup as
+`event=auto_sessions value=N policy=base-state-fit ... base_state_bytes=...
+state_capacity_bytes=... shared_kv_tokens=...` and repeated in
+`load_completed` as `sessions=auto(N)`. On this 128 GiB Strix Halo, Qwen3.8
+Flash-Next resolves to **150 sessions at 128k** and **96 at 250k**, so the
+hybrid plan reaches 150 or 96 rows instead of the former 32-row control.
+
+The scheduler starts with one resident session and grows toward visible demand
+while the shared KV pool has room. The admission estimate for a request is its
+prompt length plus its requested output budget; an unlimited request reserves a
+conservative 512-token short-chat budget instead of the whole remaining context.
+The estimate is compared against the pool's free blocks plus the reservations
+of requests that are admitted but not yet mapped. If it does not fit, the
+request stays queued and admission retries after 20 ms; the oldest request may
+still start when nothing else is resident so one long prompt cannot deadlock.
+When the queue drains, the resident bound returns to one without preempting
+live work. A single-user server therefore stays at one session and only pays
+for concurrency while requests are actually waiting.
+
+Auto mode also changes failure handling. A request that cannot get device KV
+blocks is deferred and retried instead of being failed. The scheduler ignores
+the fixed-mode deferral limit, the snapshot-pending refusal and the degradation
+patience timeout: the request keeps its retained host snapshot, releases its
+device state, and re-enters the waiting queue after 20 ms. Only client
+cancellation or a real model error ends it; a configured `--request-timeout-ms`
+does not abort a request while it is deferred for KV. `--max-pending` still
+bounds the admission queue; auto mode does not turn queue-full admission into
+unlimited waiting.
+
+Because the final session count is resolved after model load, auto-mode servers
+disable device-row lending for prefix-cache checkpoints. A completed request
+keeps its checkpoint rows on the host instead of pinning pool blocks, so a cache
+checkpoint cannot starve requests that are still waiting to prefill.
+Fixed-session servers keep lending enabled.
+
+Auto mode applies to text LLM serving. Embeddings, image, TTS, ASR and video
+servers keep their own fixed queues and do not accept `--sessions auto`.
+
+The 2026-11-05 build, which still sized by full context, resolved 12 sessions
+at 128k; its bounded sweep is retained in [the Flash-Next auto-session
+benchmark](models/qwen3.8-flash-next/BENCHMARKS.md#auto-sessions-at-128k-2026-11-05).
+With base-state sizing, a 250k server resolves 96 sessions: 100 prompts of
+about 3,000 tokens (306,093 prompt tokens total) all completed with HTTP 200 in
+238.6 s, while the shared pool's high-water mark stayed at 1,675 of 1,954
+blocks instead of being oversubscribed.
+
 The batch width is a per-model capability. Qwen3.8 Flash-Next advertises
-batched plans from two to **32 rows**, so a 32-session pool decodes in one
-physical pass; its MTP drafting stays on the eight-row gate, which means a
-wider cohort decodes autoregressively. Qwen3.8 27B and DeepSeek V4 Flash keep
-their eight-row limit, because a sixteen-row plan split their K-quant attention
-projections into two eight-row passes and lost 3-6% aggregate throughput.
-Decode width is also a throughput/latency trade: on Flash-Next, widths 24 and
-32 deliver nearly the same total rate, while 24 keeps noticeably more
-per-request decode rate and lower TTFT
-([measurements](models/qwen3.8-flash-next/BENCHMARKS.md)).
+batched plans from two to **256 rows**. Auto sessions fill the decode cohort up
+to the resolved session count, so the plan scales with the pool: 96 rows at
+250k, 150 at 128k, 256 at short context. Wide plans (>32 rows) use the
+compacted expert buckets for the routed Q4_K projection; narrow tails keep the
+grouped vector path, and the dense, attention and shared-expert work uses the
+full plan width. Its MTP drafting stays on the
+eight-row gate, which means a wider cohort decodes autoregressively. Qwen3.8
+27B and DeepSeek V4 Flash keep their eight-row limit, because a sixteen-row
+plan split their K-quant attention projections into two eight-row passes and
+lost 3-6% aggregate throughput. Decode width is also a throughput/latency
+trade: on Flash-Next, widths 24 and 32 deliver nearly the same total rate,
+while 24 keeps noticeably more per-request decode rate and lower TTFT
+([measurements](models/qwen3.8-flash-next/BENCHMARKS.md#wide-decode-plans-2026-11-06)).
+At 1024 concurrent requests with 32 output tokens, 256 rows measured
+**61.0 tok/s** aggregate TG (533.8 s) against **56.8 tok/s** for 32 rows
+(574.0 s), +7.4 %; a 16-output prefill-bound run was neutral before the later
+decode work and the wide Q8 Dense route, which bring 1024x16 to
+**144.4 s / 7.09 requests/s / 113.5 TG / 673.2 PP** (see the
+[Flash-Next benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md#wide-moe-dispatch-and-gdn-state-writeback-2026-11-07)).
+
+The shared paged KV pool is capped by `--kv-pool-bytes N|off`. The default `0`
+derives the budget from free device memory after the weights, capped at
+`sessions x context`; `off` keeps one full-context session as the floor. A
+session maps blocks on write, so short conversations do not reserve their full
+context. `usage.gufo.component_cache.global_kv_pool` and the
+`kv_blocks_shared` log line report capacity, live, free and high-water blocks.
 
 Text serving defaults match llama.cpp for context and generation length:
 
@@ -135,7 +212,7 @@ Text serving defaults match llama.cpp for context and generation length:
 | `--context` | `0`: native context from model metadata, per session |
 | `--enable-yarn` | Off; Flash-Next requires it for `--context` above 262144 |
 | `--max-tokens` | `-1`: until EOS or remaining context is exhausted |
-| `--sessions` | `1` |
+| `--sessions` | `1`; `auto` sizes from base state and shared KV after model load |
 | Thinking / reasoning effort | Enabled; Qwen `xhigh`, DeepSeek `high` |
 
 Qwen chat prompts are bounded by the session context, not a fixed size: the
@@ -301,6 +378,13 @@ checkpoint in RAM and pins no cache memory, except up to 512 MiB of backing that
 Qwen and Flash-Next use for captures when `--cache-disk` is set. Each session
 still reuses its own live state, and `--cache-disk` keeps working. See
 [KV-CACHE.md](KV-CACHE.md#limits) for what off keeps and drops.
+
+Cold retention is gated. A unique single-turn prompt is not retained unless
+there is evidence of reuse (a hit, a waiting peer sharing the prefix, or a
+repeated/extended prompt) or the operator passes `--cache-retain-cold`. This
+keeps one-off traffic from filling the RAM ledger; a measured cold-only run
+kept 0.35 MB of ledger instead of 935 MB. The gate applies to the component
+cache; direct `ComponentTextCache` users keep their own retention policy.
 
 Qwen27B uses component-cache slots in both AR and DFlash2 modes. A checkpoint
 includes target KV and recurrent state, image-prefix identity, sampled frontier
@@ -841,8 +925,8 @@ Image inputs still undergo the usual image loading and validation and may
 populate the CPU image-preprocessing cache. Generation options are validated as
 usual, but `stream: true` is accepted and still returns
 one JSON count response. Output-token limits are not added to `input_tokens`.
-Malformed requests return 400, a model that is not served returns 404, and a
-backend without prompt-count support returns 501. As with generation, Responses
+Malformed requests return 400. Missing and unknown text model names resolve to
+the loaded model; a backend without prompt-count support returns 501. As with generation, Responses
 clients must supply the complete conversation; server-side history is not
 resolved by these endpoints.
 
@@ -986,6 +1070,16 @@ backends do not accelerate: verification ends its accepted run at every EOS it
 emits, so each crossing clips the draft window. Expect decode near the
 autoregressive rate in that region, not the rate the same model reaches on an
 ordinary continuation.
+
+## Text model names
+
+The text server always executes against its one loaded model. `model` is
+optional on Chat Completions, Completions, Responses, Messages, count-tokens
+and apply-template. A name listed by `/v1/models` is echoed in the response;
+a missing, empty or unknown name resolves to the primary served model and is
+executed normally. Unknown text model names no longer return
+`404 model_not_found`. Non-text services (embeddings, image, TTS, ASR and
+video) keep their own model checks.
 
 ## Chat Completions Adapter
 
@@ -1304,7 +1398,7 @@ Use appropriate HTTP status codes:
 
 - `400` invalid request or unsupported field
 - `401` missing or invalid configured bearer token
-- `404` unknown model or endpoint object
+- `404` unknown endpoint object, or an unsupported model on a non-text service
 - `409` incompatible session state
 - `413` request or prompt too large
 - `429` admission queue full or rate limit exceeded
@@ -1342,6 +1436,19 @@ and API key for inference and metrics.
 as the bearer credential when it is set.
 
 ## Lifecycle and limits
+
+The listener backlog is `max(1024, --max-connections)`, capped by `SOMAXCONN`;
+the accept loop drains the queue every 10 ms. Responses still use
+`Connection: close`, so a client that sends many requests should use a bounded
+connection pool. Under rootless Podman the `pasta` port forwarder has its own
+128-entry listen backlog; for a 1024-connection handshake burst use
+`--network=host` or cap the client socket pool (256 was sufficient). With host
+networking and a 1024-socket pool, 1024/1024 requests completed with zero
+`ReadError`s; the same run with 1024 connections through a small `pasta`
+backlog produced client-side resets. `--max-connections` must still be at
+least the accepted concurrency, and `--pids-limit`/`--ulimit nofile` must cover
+the connection threads.
+
 
 Qwen image inputs have no fixed image-count cap. Their expanded tokens must fit
 the model context; image-byte, pixel, request-body and read-time budgets still

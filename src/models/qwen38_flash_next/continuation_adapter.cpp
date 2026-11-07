@@ -840,6 +840,8 @@ std::span<const std::byte> ContinuationAdapter::BorrowRowsView(
           (end - first) * row};
 }
 bool ContinuationAdapter::LendDeviceRows() const {
+  if (model_ && !model_->DeviceRowLending())
+    return false;
   const auto gauges = PoolGauges();
   if (!gauges)
     return true;

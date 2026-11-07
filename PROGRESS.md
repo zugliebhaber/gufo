@@ -1624,3 +1624,64 @@ Build-Umgebung). Analyse und Rohdaten:
 zeilenweise GEMMs nötig); Prefill/Decode-Overlap (Dual-Lane) und die
 Kernel-Hebel A3/N2/N3 sind nicht implementiert; die Details stehen in
 `artifacts/serving/batch-pp-tg-levers.md` Abschnitt 13.7.
+
+## Nachtrag: 5.-7. November 2026 — breite Pläne, MoE-Dispatch und GDN-State
+
+**Korrektur zur Kohorte.** Die stabile Prefix-Chunk-Grenze schließt die
+Arithmetik der Batched-Prefill-Kohorte an den seriellen Frontier an. Der
+deterministische 256-Prompt-Vergleich besteht bei Kohorte 8, 16 und 32
+(256/256); die Kohorte ist Default-on mit Cap `min(32, prefilling queue depth)`,
+`GUFO_BATCHED_PREFILL=0` bleibt Diagnose-Kill-Switch. Die frühere Aussage
+„nicht bit-identisch" ist damit überholt.
+
+**Breite Pläne und Auto-Sessions.** `kMaxBatchSessions` steigt von 32 auf
+**256**; der Hybrid-Plan füllt die Breite, die die Resident-Kohorte hergibt.
+`--sessions auto` löst den Pool nach dem Laden aus der gemessenen
+Base-State-Kapazität (25 % Reserve), wächst mit der Nachfrage und deferred
+KV-blockierte Requests statt sie zu verwerfen. Auf diesem Host: 96 Sessions
+bei 250k, 150 bei 128k, 256 bei kurzem Kontext. `GUFO_DECODE_MAX_ROWS` und
+`GUFO_ASSEMBLE_DECODE_ROWS` bleiben A/B-Overrides.
+
+**Vier messbare Decode-Hebel (2x2-A/B, 4k/256, 1024x16):**
+
+| Hebel | vorher | nachher | Delta |
+| --- | --- | --- | --- |
+| #28 Wide-MoE-Dispatch (kompaktierte Expert-Buckets) | 210,2 s / 78,0 TG / 462 PP | 177,0 s / 92,6 TG / 549 PP | −15,8 % Wall, +18,7 % TG |
+| #25 Wide-Expert-Tiles (64/128 statt 16 Zeilen) | 176,28 s / 92,95 TG | 174,59 s / 93,85 TG | −1,0 % Wall, +1,0 % TG |
+| #51 GDN-State-Writeback (4×16 B statt 32×2 B) | 174,78 s / 93,75 TG / 555,6 PP | 156,48 s / 104,7 TG / 621,1 PP | −10,5 % Wall, +11,7 % TG |
+| #52 Weite Q8-Projektionen auf der W8A8/F16-Dense-Route | 155,4 s / 6,59 req/s / 105,4 TG | 145,3 s / 7,05 req/s / 112,8 TG | −6,5 % Wall, +7,0 % req/s |
+
+256x128: #28 103,5 → 81,0 s (114,3 → 145,8 TG); #51 auf #28/#25 43,71 →
+39,52 s bei 256x16. Jede Änderung ist 256/256 deterministisch. Das
+ausgelieferte Binary bestätigt **144,4 s / 7,09 req/s / 113,5 TG / 673,2 PP**
+bei 1024x16; #52 verbessert 256x128 von 64,1 auf 57,1 s (184,3 → 208,0 TG).
+
+**PP-Seite.** Nach dem Decode-Speedup wurden die Prefill-Hebel erneut geprüft:
+Cohort 64/48/24 ergeben 160,4/171,1/158,7 s gegen 144,4 s bei 32; Assembly
+192/128 ergeben 159,0/161,0 s gegen 156,4 s bei 256 (Vor-#52-Binary). Das
+Optimum bleibt Cohort 32 und Assembly 256. Der Frontier-Split (stabile
+Prefix-Grenze) lässt sich nicht in einen Pass zusammenfassen, ohne die
+Frontier-Arithmetik zu ändern (früherer 10,01-Logit-Mismatch);
+Prefill/Decode-Overlap braucht partitionierten Scratch und einen zweiten
+Stream und bleibt der strukturelle PP-Hebel.
+
+**Weitere Änderungen.** HTTP-Accept-Backlog 1024 plus Drain-Schleife und
+10-ms-Poll für 256+-Bursts; Modell-Alias-Fallback (unbekannte/missing
+Modellnamen lösen auf das geladene Modell auf); Tool-Parameter-Prüfung gegen
+das deklarierte JSON-Schema; Stop-Sequenz- und Text-Span-Härtung;
+Bildlimits 20 MiB/32 MP; `--cache-retain-cold` für die Retention-Gate;
+KV-Pool-Gauges und Host-Snapshot-Sharing-Metriken; `gufo diagnose` mit
+Power-Profil und Queue-Budget; `tools/bench/gather_bw.hip` für die
+Bandbreiten-Kalibrierung.
+
+Die konsolidierte Feature-Liste mit Zweck und Belegen steht in
+[`docs/FEATURES.md`](docs/FEATURES.md), die 52 Maßnahmen mit Status in
+[`docs/BATCH-THROUGHPUT.md`](docs/BATCH-THROUGHPUT.md), die neuen
+Modellzahlen in
+[`docs/models/qwen3.8-flash-next/BENCHMARKS.md`](docs/models/qwen3.8-flash-next/BENCHMARKS.md).
+
+**Noch offen:** GDN-State-Bandbreite ist nach #51 nicht mehr der dominante
+Posten; verbleibende Kandidaten sind Prefill/Decode-Overlap (Dual-Lane),
+niedrigere Experten-Quantisierung und die in `BATCH-THROUGHPUT.md` gelisteten
+Fusions-/Cache-Hebel. Rejected bleiben #22, #27, #31, #34 und der FP8-KV-
+Prototyp (Details in den jeweiligen Dokumenten).

@@ -344,6 +344,14 @@ public:
     const auto names = model_ids();
     return std::ranges::find(names, name) != names.end();
   }
+  /// Resolve a requested model name to the loaded model.
+  ///
+  /// A name listed by model_ids() is kept so aliases still echo as before.
+  /// Missing, empty and unknown names fall back to the primary model, because
+  /// this process serves exactly one loaded text model.
+  [[nodiscard]] std::string resolve_model(std::string_view requested) const {
+    return serves_model(requested) ? std::string(requested) : model_id();
+  }
   [[nodiscard]] virtual bool ready() const = 0;
   /// True once a failed generation showed that the execution device can no
   /// longer run work, for example after a GPU reset. The loss is permanent.

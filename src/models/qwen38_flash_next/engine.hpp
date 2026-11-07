@@ -14,6 +14,7 @@
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/core/speculative/prompt_lookup.hpp"
+#include "src/models/qwen/kv_blocks.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
@@ -63,6 +64,12 @@ struct ModelOptions {
   /// a full context per session. Sessions map blocks lazily, so the pool only
   /// has to cover the tokens actually in flight.
   std::uint64_t kv_pool_budget_bytes = 0;
+  /// A pool sized for one session can be smaller than the server's admitted
+  /// batch. In that case a cache checkpoint must keep its rows on the host:
+  /// lending device rows would pin every pool block to a completed request and
+  /// starve requests still waiting to prefill. Auto-session servers disable
+  /// lending because their final session count is resolved after model load.
+  bool device_row_lending = true;
   /// Static YaRN scaling, derived by the caller (serve, bench) from the
   /// requested context via `RopeScalingForContext`. Empty leaves the
   /// artifact's own setting, which is always off: no GGUF metadata key sets
@@ -125,6 +132,9 @@ public:
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
+  [[nodiscard]] bool DeviceRowLending() const noexcept {
+    return options_.device_row_lending;
+  }
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] const tokenization::QwenTokenizer& tokenizer() const noexcept {
@@ -134,6 +144,10 @@ public:
   /// Worst-case private device state, including the configured rollback cap.
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const noexcept;
+  /// Shared paged-KV pool gauges, when the executor owns one. Admission uses
+  /// free blocks to decide how many requests can be resident at once.
+  [[nodiscard]] std::optional<qwen::KvPoolSnapshot> KvPoolSnapshot()
+      const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {

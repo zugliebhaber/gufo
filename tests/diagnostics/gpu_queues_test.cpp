@@ -71,7 +71,8 @@ using gufo::diagnostics::QueueCensus;
 using gufo::diagnostics::QueueProfile;
 
 /// Mirrors `/sys/class/drm`: a card directory with the dpm level plus connector
-/// entries (`card1-DP-1`, ...) that share the `card` prefix and must be skipped.
+/// entries (`card1-DP-1`, ...) that share the `card` prefix and must be
+/// skipped.
 class FakeDrm {
 public:
   FakeDrm()

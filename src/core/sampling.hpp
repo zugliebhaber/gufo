@@ -158,7 +158,7 @@ public:
   /// Publish RNG and any deferred draw without accepting tentative history.
   void CopyDrawStateFrom(const SamplerState& other) noexcept;
   struct DrawState {
-    std::uint64_t rng;
+    std::uint64_t rng{0};
     std::optional<TokenId> pending;
   };
   [[nodiscard]] DrawState SaveDrawState() const noexcept {

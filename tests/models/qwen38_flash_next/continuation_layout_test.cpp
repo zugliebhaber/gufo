@@ -53,7 +53,10 @@ void Check(bool mtp) {
   const qfn::ContinuationLayout layout(c, mtp, 100000, 8);
   Require(layout.Components().size() == (mtp ? 130 : 124),
           "state inventory omitted a component");
-  Require(layout.PrivateBytes() == (mtp ? 133032096 : 131614880),
+  // The live GDN recurrent state is bf16 (SsmState = hip_bfloat16), matching
+  // the executor checkpoint: 36 linear layers x 48*128*128*2 B. An F32
+  // assumption would double-count exactly those 56,623,104 bytes.
+  Require(layout.PrivateBytes() == (mtp ? 76408992 : 74991776),
           "private byte claim differs from independent geometry");
   Require(layout.RawCapacity() == 2048, "raw ring reserve is not bounded");
   for (const auto target : {32768U, 100000U}) {

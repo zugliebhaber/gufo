@@ -10,6 +10,7 @@
 #include "qfn_mmq.h"
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/debug_dump.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
@@ -19,9 +20,9 @@ namespace {
 
 // Widest decode cohort. Every session reads each shared projection once per
 // physical pass; kDecodeRows stays the established eight-row kernel tile so
-// wider cohorts run the already-qualified chunked paths. The cohort bound is
-// thirty-two so one pass can cover a full 32-session pool instead of running
-// two sixteen-row waves that repeat the same weight traffic.
+// wider cohorts run the already-qualified chunked paths. The capacity is 256;
+// auto sessions select the plan width up to the resolved pool, and
+// GUFO_DECODE_MAX_ROWS narrows it for A/B runs.
 constexpr std::uint32_t kBatchSessions = kMaxBatchSessions;
 constexpr std::uint32_t kDecodeRows = 8;
 
@@ -719,6 +720,12 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
               stream_);
     return true;
   }
+  // Wide Q8 projections reuse each weight block across the wider activation
+  // tiles of the W8A8/F16 Dense route; the 32-row MMVQ tiles re-read the
+  // weights for every group. Output-identical on the deterministic 256-prompt
+  // gate and neutral per token at 64 rows.
+  if (rows > 48)
+    return Dense(w, x, out, rows, error);
   if (!QuantizeBatch(x, rows, w.cols, error))
     return false;
   const auto project = [&](std::uint32_t first, std::uint32_t count) {
@@ -730,29 +737,13 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                w.cols, stream_) == 0 ||
            Fail(error, "batched Q8 projection failed");
   };
-  if (w.rows == 320 && w.cols == 10240) {
-    const auto full = rows / kDecodeRows * kDecodeRows;
-    return project(0, full) && (full == rows || project(full, rows - full));
-  }
-  // Three matrix tiles help 33–48 rows; four tiles cost more than two
-  // 32-row launches. Small outputs with long K sweeps stay at eight. Eight-row
-  // tiles also keep the gated and ungated launches identical in width; the
-  // MMVQ dispatch rejects more than eight rows when a gate pointer is present,
-  // and the wide Q8_0 regrouping measured neutral (see PROGRESS.md).
-  const auto chunk =
-      ((w.cols == 2560 && w.rows >= 1024) || (w.cols == 320 && w.rows == 10240))
-          ? (w.cols == 2560 && w.rows >= 8192 && rows > 32 && rows <= 48 ? 48U
-                                                                         : 32U)
-          : kDecodeRows;
-  if (chunk == 32 && rows >= 64) {
-    const auto full = rows / 32 * 32;
-    return project(0, full) && (full == rows || project(full, rows - full));
-  }
-  for (std::uint32_t r = 0; r < rows; r += chunk) {
-    if (!project(r, std::min(chunk, rows - r)))
-      return false;
-  }
-  return true;
+  // The MMVQ dispatcher already carries 1..32 rows in one launch with
+  // internal 2/3/4 eight-row waves, and the matrix shapes support up to 48
+  // rows. Do not pre-split into eight-row launches: that turns a 9/17/25-row
+  // batch into a full launch plus a one-row tail that pays another weight
+  // read. The 16/32/48-token matrix kernel reuses one weight block across the
+  // tile.
+  return project(0, rows);
 }
 
 bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
@@ -798,6 +789,27 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     return Moe(l, x, out, rows, error);
   if (rows <= kDecodeRows)
     return Moe(l, x, out, rows, error);
+  // Wide decode plans route many rows to the same experts. The compacted
+  // matrix route folds those assignments into 16/64-row expert buckets and
+  // reuses each expert's weights across the bucket; the GEMV groups only
+  // eight token rows per weight read. Delegate whenever Moe's routed experts
+  // take that matrix route, and keep the GEMV for narrower tails.
+  if (ExpertMatrixRows(rows)) {
+    if (!Moe(l, x, out, rows, error))
+      return false;
+    if (moe_pending_) {
+      // The wide route leaves the routed epilogue for the following combine
+      // to fold in. A decode batch's CombineBatch does not carry that
+      // contract, so settle it here before the batch combine reads the block.
+      moe_pending_ = false;
+      const auto& cfg = config();
+      MoeEpilogueVec4F16(reinterpret_cast<const __half*>(s_.down_e), s_.weights,
+                         s_.shexp_out, s_.router + cfg.num_experts,
+                         cfg.num_experts + 1, out, rows, cfg.num_experts_used,
+                         cfg.hidden_size, stream_);
+    }
+    return true;
+  }
   const auto& c = config();
   const Scratch base = s_;
   if (!DenseBatch(l.router, x, base.router, rows, error))
@@ -810,18 +822,30 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     return false;
   if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
       l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
-    // Share expert weights across request boundaries while retaining the
-    // scalar Q8 activation quantization and dot-product reduction.
-    if (qfn_mmq_moe_gated_vec(static_cast<int>(l.ffn_gate_exps.type),
-                              l.ffn_gate_exps.data, l.ffn_up_exps.data, x,
-                              base.ids, base.gate_e, c.expert_ff, c.hidden_size,
-                              rows, c.num_experts, c.num_experts_used,
-                              stream_) != 0 ||
-        qfn_mmq_moe_vec(
-            static_cast<int>(l.ffn_down_exps.type), l.ffn_down_exps.data,
-            base.gate_e, base.ids, base.down_e, c.hidden_size, c.expert_ff,
-            rows * c.num_experts_used, c.num_experts, 1, stream_) != 0)
-      return Fail(error, "batched routed vector projection failed");
+    // The routed Q4_K kernel is qualified for at most 64 independent rows.
+    // Wider plans keep the full-width router/shared-expert/attention work and
+    // split only this projection into 64-row launches.
+    constexpr std::uint32_t kRoutedChunk = 64;
+    for (std::uint32_t r = 0; r < rows; r += kRoutedChunk) {
+      const auto n = std::min(kRoutedChunk, rows - r);
+      const auto gate_offset =
+          std::size_t{r} * c.num_experts_used * c.expert_ff;
+      const auto down_offset =
+          std::size_t{r} * c.num_experts_used * c.hidden_size;
+      if (qfn_mmq_moe_gated_vec(
+              static_cast<int>(l.ffn_gate_exps.type), l.ffn_gate_exps.data,
+              l.ffn_up_exps.data, x + std::size_t{r} * c.hidden_size,
+              base.ids + std::size_t{r} * c.num_experts_used,
+              base.gate_e + gate_offset, c.expert_ff, c.hidden_size, n,
+              c.num_experts, c.num_experts_used, stream_) != 0 ||
+          qfn_mmq_moe_vec(static_cast<int>(l.ffn_down_exps.type),
+                          l.ffn_down_exps.data, base.gate_e + gate_offset,
+                          base.ids + std::size_t{r} * c.num_experts_used,
+                          base.down_e + down_offset, c.hidden_size, c.expert_ff,
+                          n * c.num_experts_used, c.num_experts, 1,
+                          stream_) != 0)
+        return Fail(error, "batched routed vector projection failed");
+    }
     MoeEpilogue(base.down_e, base.weights, base.shexp_out,
                 base.router + c.num_experts, c.num_experts + 1, out, rows,
                 c.num_experts_used, c.hidden_size, stream_);
@@ -844,8 +868,11 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   selected_logits_ = nullptr;
   DropReadyQ8();
   const Config& c = config();
+  if (c.compress_ratio == 0)
+    return Fail(error, "compress ratio must be positive");
   if (items.empty() || items.size() > kBatchSessions) {
-    return Fail(error, "decode batch must contain 1..32 sessions");
+    return Fail(error, "decode batch must contain 1.." +
+                           std::to_string(kBatchSessions) + " sessions");
   }
   std::array<std::uint32_t, kBatchSessions> offsets{};
   std::array<bool, kBatchSessions> sparse{};
@@ -1147,9 +1174,14 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       }
     }
     UseScratch(base);
-    return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
-                      rows, error) &&
-           DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
+    if (!HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
+                    rows, error))
+      return false;
+    // The vocabulary head is the widest projection in the step. The Dense
+    // route tiles it over wider activation blocks than the 32-row batched
+    // MMVQ tiles and reuses each weight block across more token rows; it is
+    // output-identical on the deterministic 256-prompt gate.
+    return Dense(model_->output(), base.mixed, batch_logits_, rows, error);
   };
   bool ok = false;
   try {
@@ -1181,8 +1213,11 @@ bool Executor::ForwardPrefillBatch(std::span<const PrefillItem> items,
   selected_logits_ = nullptr;
   DropReadyQ8();
   const Config& c = config();
+  if (c.compress_ratio == 0)
+    return Fail(error, "compress ratio must be positive");
   if (items.empty() || items.size() > kBatchSessions) {
-    return Fail(error, "prefill batch must contain 1..32 sessions");
+    return Fail(error, "prefill batch must contain 1.." +
+                           std::to_string(kBatchSessions) + " sessions");
   }
   const auto any_active = [&]() {
     return std::any_of(items.begin(), items.end(), [](const PrefillItem& item) {
@@ -1318,10 +1353,13 @@ bool Executor::ForwardPrefillBatch(std::span<const PrefillItem> items,
           items[i].session->position_, items[i].tokens.size(), c.hidden_size,
           c.hc_count, stream_);
     }
+    debug::DumpPrefillLayer("batch", 0, base.res, rows * c.HcDim());
     const auto& layers = model_->layers();
+    bool normed = false;
     for (std::uint32_t il = 0; il < c.num_layers; ++il) {
       if (!any_active())
         return true;
+      const bool staged_half = xn_half_;
       const auto& l = layers[il];
       if (c.IsPleLayer(il) && !WaitPle(error))
         return false;
@@ -1335,14 +1373,12 @@ bool Executor::ForwardPrefillBatch(std::span<const PrefillItem> items,
         }
       }
       // `UseScratch` drops the staging contract `Combine` leaves for the next
-      // mixer (`xn_half_`) and the deferred MoE epilogue (`moe_pending_`).
-      // Switching back to the cohort's own view must keep both.
+      // mixer (`xn_half_`). Switching back to the cohort's own view restores
+      // the pointers; restore the flag too so the attention mixer consumes
+      // exactly the norm the previous combine staged, as the serial path does.
       s_ = base;
-      // A cohort recomputes each norm instead of consuming the fused F16/Q8
-      // staging: the per-session views below drop that staging on purpose, and
-      // a stale F32 norm would corrupt every layer. `half_only` is likewise
-      // off, so `mixed` keeps valid F32 rows for the per-session attention.
-      if (!HcMix(l.hc_attn, base.res, false, base.mixed, base.inject, rows,
+      xn_half_ = staged_half;
+      if (!HcMix(l.hc_attn, base.res, normed, base.mixed, base.inject, rows,
                  error))
         return false;
       // Each session runs the single-session prefill form of its attention or
@@ -1380,7 +1416,7 @@ bool Executor::ForwardPrefillBatch(std::span<const PrefillItem> items,
       s_ = base;
       defer_residual_ = WmmaExperts(l, rows);
       Combine(base.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn));
-      if (!HcMix(l.hc_ffn, base.res, false, base.mixed, base.inject, rows,
+      if (!HcMix(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
                  error) ||
           !Moe(l, base.mixed, base.block_out, rows, error))
         return false;
@@ -1394,6 +1430,8 @@ bool Executor::ForwardPrefillBatch(std::span<const PrefillItem> items,
                                      : nullptr;
       s_ = base;
       Combine(base.res, next_norm, rows, next_inject);
+      normed = next_norm != nullptr;
+      debug::DumpPrefillLayer("batch", il + 1, base.res, rows * c.HcDim());
     }
     // One gathered last row per item: the head only ever needs each
     // session's frontier. The head runs the single-session decode arithmetic

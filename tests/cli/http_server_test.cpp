@@ -617,7 +617,7 @@ void TestApplyTemplate() {
   ExpectStatus(server.Post("/apply-template",
                            R"({"model":"other",
                                "messages":[{"role":"user","content":"hi"}]})"),
-               404);
+               200);
   // A template error is the request's, as in Chat.
   server.backend->render_error = "No user query found in messages.";
   const auto invalid = server.Post("/apply-template", chat);
@@ -709,7 +709,7 @@ void TestOpenAiInputTokens() {
     ExpectStatus(server.Post(path, invalid.dump()), 400);
     invalid = body;
     invalid["model"] = "not-loaded";
-    ExpectStatus(server.Post(path, invalid.dump()), 404);
+    ExpectStatus(server.Post(path, invalid.dump()), 200);
     for (int failure : {1, 2}) {
       server.backend->count_failure = failure;
       const auto rejected = server.Post(path, body.dump());
@@ -1126,10 +1126,12 @@ void TestCompatibilityRequests() {
     ExpectStatus(server.Post(endpoint.path, invalid.dump()), 400);
     invalid = body;
     invalid["model"] = "wrong";
-    ExpectStatus(server.Post(endpoint.path, invalid.dump()), 404);
+    ExpectStatus(server.Post(endpoint.path, invalid.dump()), 200);
     ExpectStatus(server.Post(endpoint.path, "[]"), 400);
     ExpectStatus(server.Post(endpoint.path, "{"), 400);
-    assert(server.backend->calls == calls);
+    // The unknown model is now served by the loaded model, so this request
+    // reaches generation; the later malformed requests still do not.
+    assert(server.backend->calls == calls + 1);
     if (streams) {
       // A null stream is unset, as on Chat Completions.
       auto unset = body;
@@ -1180,7 +1182,7 @@ void TestCompatibilityRequests() {
   ExpectStatus(server.Post("/v1/messages/count_tokens",
                            R"({"model":"other","messages":[
                              {"role":"user","content":"hi"}]})"),
-               404);
+               200);
   server.backend->chat_token_count.reset();
 
   for (const auto& [url, expected] :
@@ -2038,8 +2040,14 @@ void TestServedModelNames() {
     ExpectStatus(response, 200);
     assert(!endpoint.echoes || body_of(response).member_str("model") == "test");
     const auto unknown = post(endpoint, "additional");
-    ExpectStatus(unknown, 404);
-    assert(unknown.find("model_not_found") != std::string::npos);
+    ExpectStatus(unknown, 200);
+    assert(!endpoint.echoes || body_of(unknown).member_str("model") == "test");
+    assert(unknown.find("model_not_found") == std::string::npos);
+    const auto without_model =
+        server.Post(endpoint.path, std::string("{") + endpoint.fields + "}");
+    ExpectStatus(without_model, 200);
+    assert(!endpoint.echoes ||
+           body_of(without_model).member_str("model") == "test");
   }
 
   server.backend->names = {"test", "additional", "books"};
@@ -2052,8 +2060,9 @@ void TestServedModelNames() {
              body_of(response).member_str("model") == model);
     }
     const auto unknown = post(endpoint, "other");
-    ExpectStatus(unknown, 404);
-    assert(unknown.find("model_not_found") != std::string::npos);
+    ExpectStatus(unknown, 200);
+    assert(!endpoint.echoes || body_of(unknown).member_str("model") == "test");
+    assert(unknown.find("model_not_found") == std::string::npos);
   }
   // Streamed events carry the additional name the request selected.
   const auto streamed = server.Post(

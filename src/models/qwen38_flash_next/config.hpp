@@ -17,7 +17,12 @@ namespace gufo::models::qwen38_flash_next {
 /// control/staging arrays and the routed-expert scratch, and it is the width a
 /// single physical pass can cover; the kernel tiles stay at eight rows and
 /// wider cohorts run the qualified chunked paths.
-inline constexpr std::uint32_t kMaxBatchSessions = 32;
+// Physical decode-cohort capacity and advertised plan ceiling. The scheduler
+// selects the widest plan the resident cohort can fill; auto sessions therefore
+// scale the plan with the resolved pool. Above 64 rows the routed Q4_K expert
+// projection is split into qualified 64-row launches, while dense, attention
+// and shared-expert work uses the full plan width.
+inline constexpr std::uint32_t kMaxBatchSessions = 256;
 
 /// Architecture parameters of a `qwen4exp` GGUF artifact. Every value is read
 /// from the file; the fixed limits below only bound what this runtime was

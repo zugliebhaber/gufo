@@ -1,6 +1,6 @@
 # KV Cache
 
-> See the [architecture](ARCHITECTURE.md), [cache redesign RFC](cache-redesign/RFC.md) and [server contract](SERVER.md).
+> See the [architecture](ARCHITECTURE.md), [cache redesign RFC](cache-redesign/RFC.md), [server contract](SERVER.md) and the [visual KV/pagination guide](KV-CACHE-VISUAL.md).
 
 ## What "KV cache" means here
 
@@ -198,6 +198,12 @@ then prefilling 115 tokens **(measured)**. With a 242-token shared prefix the
 gain was about 1 s of 9 s, which is why short prefixes do not wait.
 
 ## What gets retained
+
+Retention is gated by evidence of reuse. A cold, unique single-turn prompt is
+not retained by default; a cache hit, a waiting peer that shares the prefix, a
+repeated or extended prompt, or `--cache-retain-cold` opts it in. This keeps
+one-off traffic from filling the RAM ledger (measured: 935 MB of ledger growth
+for eight unique prompts without the gate, 0.35 MB with it).
 
 The unit of retention is a **checkpoint**, not a conversation. A single request
 can retain up to four intermediate checkpoints in addition to its branching

@@ -1539,6 +1539,30 @@ __device__ __forceinline__ float LoadSsmState(const SsmState* p) {
 __device__ __forceinline__ void StoreSsmState(SsmState* p, float v) {
   *p = v;
 }
+/// Round-to-nearest-even bf16 encoding used by the device assignment.
+__device__ __forceinline__ std::uint16_t SsmStateBits(float value) {
+  std::uint32_t bits = __float_as_uint(value);
+  if ((bits & 0x7F800000U) != 0x7F800000U) {
+    bits += 0x7FFFU + ((bits >> 16) & 1U);
+  } else if ((bits & 0xFFFFU) != 0) {
+    bits |= 0x10000U;
+  }
+  return static_cast<std::uint16_t>(bits >> 16);
+}
+/// Store eight adjacent state elements as one 16-byte transaction. Scalar
+/// bf16 stores leave the warp writing 2-byte words at a 64-byte lane stride,
+/// which the memory system splits into many transactions.
+__device__ __forceinline__ void StoreSsmState8(SsmState* p, const float* row) {
+  const std::uint32_t w0 =
+      SsmStateBits(row[0]) | (std::uint32_t{SsmStateBits(row[1])} << 16);
+  const std::uint32_t w1 =
+      SsmStateBits(row[2]) | (std::uint32_t{SsmStateBits(row[3])} << 16);
+  const std::uint32_t w2 =
+      SsmStateBits(row[4]) | (std::uint32_t{SsmStateBits(row[5])} << 16);
+  const std::uint32_t w3 =
+      SsmStateBits(row[6]) | (std::uint32_t{SsmStateBits(row[7])} << 16);
+  *reinterpret_cast<uint4*>(p) = make_uint4(w0, w1, w2, w3);
+}
 template<bool kBatch>
 __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
                               std::uint32_t n_rows, std::uint32_t k_heads,
@@ -2060,8 +2084,8 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
     }
   }
 #pragma unroll
-  for (std::uint32_t i = 0; i < slice; ++i) {
-    StoreSsmState(S + i, row[i]);
+  for (std::uint32_t i = 0; i < slice; i += 8) {
+    StoreSsmState8(S + i, row + i);
   }
 }
 

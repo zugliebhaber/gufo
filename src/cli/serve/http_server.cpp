@@ -649,8 +649,9 @@ struct CompatibilityAllowances {
 std::string RequestedModel(const json::Value& body,
                            const TextGenerationBackend& backend) {
   const auto* model = body.find("model");
-  return model != nullptr && model->is_string() ? model->str()
-                                                : backend.model_id();
+  return backend.resolve_model(model != nullptr && model->is_string()
+                                   ? std::string_view(model->str())
+                                   : std::string_view{});
 }
 
 // Validate the text subset before dispatch so a client never gets an answer
@@ -665,9 +666,9 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
   if (const auto* model = body.find("model"); model != nullptr) {
     if (!model->is_string())
       return InvalidCompatibilityRequest("'model' must be a string");
-    if (!backend.serves_model(model->str()))
-      return Err(404, "Not Found", "requested model is not loaded",
-                 "invalid_request_error", "model_not_found");
+    // The process serves one loaded model. Known aliases are echoed by
+    // RequestedModel(); unknown or missing names route to that model instead
+    // of rejecting an otherwise valid request.
   }
   for (const std::string field : {"stream", "echo", "store", "background"}) {
     const auto* value = body.find(field);
@@ -1789,14 +1790,12 @@ std::string PeerAddress(int client_fd) {
   return text;
 }
 
-// The accept loop retires one connection per syscall and polls with a 100 ms
-// timeout, so the backlog has to absorb a whole burst. A backlog of 16 lets the
-// kernel reset clients as soon as more than sixteen connect within one poll
-// interval; measured with 256 simultaneous clients and `--max-connections 512`,
-// which is where the first `ConnectionResetError` appeared. SOMAXCONN is the
-// kernel's own ceiling, and 128 stays a sane floor for a single-user server.
+// The accept loop drains the queue every poll interval, so the backlog has to
+// absorb a whole burst. A 1024-entry floor keeps a full batch pending even when
+// --max-connections is lower; SOMAXCONN remains the kernel ceiling. The accept
+// poll below is short so the queue drains promptly.
 int ListenBacklog(std::size_t max_connections) {
-  constexpr std::size_t kFloor = 128;
+  constexpr std::size_t kFloor = 1024;
   constexpr std::size_t kCap =
       SOMAXCONN > 0 ? static_cast<std::size_t>(SOMAXCONN) : kFloor;
   return static_cast<int>(std::min(std::max(max_connections, kFloor), kCap));
@@ -1859,7 +1858,7 @@ void LoadingResponder::serve() {
   // that connects and sends nothing must not delay stop().
   constexpr auto kRequestWait = std::chrono::milliseconds(500);
   while (!stopped_.load(std::memory_order_acquire)) {
-    if (net::PollReadable(listen_fd_, 100) <= 0)
+    if (net::PollReadable(listen_fd_, 10) <= 0)
       continue;
     const int client_fd = static_cast<int>(net::AcceptClientSocket(listen_fd_));
     if (client_fd < 0)
@@ -2122,7 +2121,7 @@ void HttpServer::run(bool handle_signals) {
         break;
       }
     }
-    const int ready = net::PollReadable(listen_fd_, 100);
+    const int ready = net::PollReadable(listen_fd_, 10);
     if (ready < 0 && !net::IsSocketInterrupted())
       throw std::system_error(net::LastSocketError(), std::system_category(),
                               "poll HTTP listener");

@@ -29,7 +29,7 @@ MTP=/path/to/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
 | Setting | Flag | Notes |
 | --- | --- | --- |
 | context per session | `--context N` | native 262144; above needs `--enable-yarn` |
-| resident sessions | `--sessions N` | 1 = lowest memory/latency; 32 = one 32-row decode pass for throughput |
+| resident sessions | `--sessions N\|auto` | 1 = lowest memory/latency; 8-256 = wider decode plans; auto scales the plan with the resolved pool |
 | prefill work unit | `--prefill-chunk N` | default 16384; capped by free KV |
 | RAM prefix cache | `--cache-ram-bytes N\|off` | default auto; `off` for cold benchmarks |
 | disk continuation | `--cache-disk DIR` | one process per directory |
@@ -127,20 +127,53 @@ creating sessions.
 ## Batching, widths and limits
 
 Decode runs in waves of the model's batch width. This model advertises batched
-plans from two to **32 rows** (`kMaxBatchSessions`), so a 32-session pool
-decodes in one physical pass; MTP drafting keeps its eight-row gate, which
-means a wider cohort decodes autoregressively. Width is a throughput/latency
-trade: 24 rows deliver about 94% of the 32-row aggregate rate, while keeping
-noticeably more per-request decode rate and lower TTFT. The [retained 8/16/24/32
-table](BENCHMARKS.md#2026-11-05-re-measurement-with-the-coalescing-build)
-shows 24 vs 32 as about 321-324 vs 342-343 tok/s aggregate, 5.74-5.75 vs 4.85
-per-request TG and 10.20-10.24 vs 13.78 s TTFT in the latest runs.
+plans from two to **256 rows** (`kMaxBatchSessions`). Auto sessions fill the
+decode cohort up to the resolved count, so the plan scales with the pool: 96
+rows at 250k, 150 at 128k, 256 at short context. Wide plans (>32 rows) use the
+compacted expert buckets for the routed Q4_K projection; narrow tails keep the
+grouped vector path, and the dense, attention and shared-expert work uses the
+full plan width. MTP drafting keeps its eight-row gate, which means a wider
+cohort decodes autoregressively.
+
+Width is a throughput/latency trade. The retained 8/16/24/32 cold table shows
+24 rows at about 94 % of the 32-row aggregate rate while keeping noticeably
+more per-request decode rate and lower TTFT. For wide decode loads, 256 rows
+measured **84.8 tok/s** total TG versus **76.5** at 32 rows (+10.8 %) on
+256 requests × 128 output, and **61.0** versus **56.8 tok/s** (+7.4 %) at 1024
+requests × 32 output. See [wide decode
+plans](BENCHMARKS.md#wide-decode-plans-2026-11-06).
+
+The 2026-11-07 wide MoE dispatch, GDN state writeback and wide Q8 Dense route
+supersede those numbers on the same 4k/256 setup: 1024x16 is **144.4 s /
+7.09 requests/s / 113.5 TG / 673.2 PP** with 256/256 deterministic output. See
+[the dispatch and state
+section](BENCHMARKS.md#wide-moe-dispatch-and-gdn-state-writeback-2026-11-07),
+[the wide Q8 route](BENCHMARKS.md#wide-q8-projections-on-the-w8a8-route-2026-11-07)
+and [BATCH-THROUGHPUT](../../BATCH-THROUGHPUT.md).
 
 Prefill runs one pass at a time. A pass pays a fixed full expert-weight read
 plus a per-token part, so short prompts spend most of the pass on that fixed
-cost. An experimental pairing (`GUFO_BATCHED_PREFILL=1`) puts two cold prompts
-into one pass to share the read; it is off by default and not bit-identical to
-serial prefill, because the row-batched GEMM tiles differ with the row count.
+cost. Cold prompts are batched automatically: the cohort cap is 32 and the
+actual size is `min(32, prefilling queue depth)`, so a lone prompt still runs
+the serial pass. The batched path reproduces the serial stable-prefix chunking:
+256/256 deterministic prompts match serial for cohort 8, 16 and 32, and at
+1024×16 the automatic cohort improves wall time from 416.3 s to 214.4 s (TG
+39.4 → 76.4 tok/s, PP 233.5 → 453.3 tok/s). Prefix-cache checkpoints from a
+batched prefill are not yet restored by the component cache; the measurements
+use cache off. See
+[batch throughput levers](../../BATCH-THROUGHPUT.md#baseline-and-where-the-time-goes).
+
+With base-state auto sizing, `--sessions auto` resolves to 150 sessions at
+128k and 96 at 250k on this host, so the hybrid decode plan reaches 150 or 96
+rows instead of the former 32-row control.
+Admission charges each request's prompt plus requested output against the
+shared pool, so short conversations share the pool while long ones wait. The
+retained 128k sweep saturates aggregate decode near 76 tok/s from 16 clients;
+MTP raises single-stream decode from 28.8 to 47.9 tok/s without moving the
+aggregate. See [auto sessions at
+250k](BENCHMARKS.md#auto-sessions-at-250k-2026-11-06) for the current run and
+[the earlier 128k
+sweep](BENCHMARKS.md#auto-sessions-at-128k-2026-11-05).
 
 ### Cache, coalescing and the canonical benchmark
 

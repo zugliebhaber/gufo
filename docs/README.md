@@ -8,6 +8,7 @@ page is the map of the detailed documentation.
 | I want to… | Read |
 | --- | --- |
 | install and run my first model | [README quickstart](../README.md#quickstart), [models](models/README.md) |
+| see what this tree adds over upstream Gufo | [Features](FEATURES.md) |
 | understand the engine design | [Architecture](ARCHITECTURE.md), [KV cache](KV-CACHE.md) |
 | find a CLI command or setting | [CLI guide](CLI.md), [README settings](../README.md#commands-and-settings) |
 | call the HTTP API | [Server contract](SERVER.md) |
@@ -20,11 +21,16 @@ page is the map of the detailed documentation.
 
 ## Architecture and design
 
+- [Features added over upstream Gufo](FEATURES.md): the consolidated inventory
+  of serving, cache, decode, API, diagnostics and documentation work, each with
+  purpose, usage and evidence.
 - [Architecture](ARCHITECTURE.md): process/request flow, prefill/decode,
   MoE experts, memory/cache tiers, coalescing, benchmark flow, ADRs and
   invariants.
 - [KV cache](KV-CACHE.md): what is cached, reuse, sharing, retention and
   invalidation.
+- [Visual KV cache and pagination](KV-CACHE-VISUAL.md): block pool and page
+  tables, address translation, copy-on-write, checkpoint restore, pool sizing.
 - [Cache redesign RFC](cache-redesign/RFC.md) and its
   [cards](cache-redesign/cards/README.md): the component cache, ledger,
   checkpoints, transfers and adapters.
@@ -61,6 +67,10 @@ page is the map of the detailed documentation.
   matching and artifact retention.
 - [Performance loop](PERFORMANCE.md): measurement contract, canonical serving
   benchmark, roofline, profiling and promotion gates.
+- [Batch throughput levers](BATCH-THROUGHPUT.md): 52 ranked measures for
+  1000 concurrent requests, with measured status and expected effect.
+- [Features added over upstream Gufo](FEATURES.md): what changed, why, and the
+  retained before/after numbers.
 - [Testing](TESTING.md): hosted contract suite, focused GPU/operator/model
   checks and quality tools.
 

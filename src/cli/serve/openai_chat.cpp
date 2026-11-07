@@ -849,8 +849,7 @@ std::optional<HttpResponse> ParseToolControls(const json::Value& body,
 
 std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                                          TextGenerationBackend& backend,
-                                         ParsedChatRequest* output,
-                                         bool require_model = true) {
+                                         ParsedChatRequest* output) {
   json::Value body;
   try {
     body = json::parse(request.body);
@@ -867,18 +866,9 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     return Error(400, "Bad Request", "'model' must be a string",
                  "invalid_model");
   }
-  output->model = body.member_str("model");
-  if (output->model.empty() && !require_model) {
-    output->model = backend.model_id();
-  }
-  if (output->model.empty()) {
-    return Error(400, "Bad Request", "'model' is required", "missing_model");
-  }
-  if (!backend.serves_model(output->model)) {
-    return Error(404, "Not Found",
-                 "model '" + output->model + "' is not served by this process",
-                 "model_not_found");
-  }
+  // The loaded model serves every text request. A known alias is echoed;
+  // missing, empty and unknown names resolve to the primary model ID.
+  output->model = backend.resolve_model(body.member_str("model"));
 
   try {
     output->chat.response_format =
@@ -1546,14 +1536,15 @@ bool InterpretQwenParameter(
     return false;
   const auto* property = properties ? properties->find(name) : nullptr;
   const bool string_allowed =
-      !property || SchemaAccepts(*schema, *property,
-                                 json::Value(std::string(parameter.value)));
+      !property ||
+      (schema && SchemaAccepts(*schema, *property,
+                               json::Value(std::string(parameter.value))));
   // Prefer text if the schema permits it; parsing ambiguous scalars as JSON
   // would silently change a caller's declared string type. A union also
   // admitting other types tries those first, as llama.cpp's qwen3-coder
   // parser does.
   std::optional<json::Value> typed;
-  if (string_allowed && property) {
+  if (string_allowed && property && schema) {
     typed = TryParseJson(Trim(parameter.value));
     if (!typed || typed->is_string() ||
         !SchemaAccepts(*schema, *property, *typed))
@@ -1563,12 +1554,14 @@ bool InterpretQwenParameter(
   std::string raw(is_string ? parameter.value : Trim(parameter.value));
   if (!is_string && !typed) {
     auto parsed = TryParseJson(raw);
-    if (parsed && !SchemaAccepts(*schema, *property, *parsed))
+    if (parsed && schema && property &&
+        !SchemaAccepts(*schema, *property, *parsed))
       parsed.reset();
     if (!parsed) {
       auto converted = PythonLiteralsToJson(raw);
       auto alternative = TryParseJson(converted);
-      if (alternative && SchemaAccepts(*schema, *property, *alternative)) {
+      if (alternative && schema && property &&
+          SchemaAccepts(*schema, *property, *alternative)) {
         raw = std::move(converted);
         parsed = std::move(alternative);
       }
@@ -1969,7 +1962,10 @@ ParsedGeneration ParseGeneration(
       // Text outside complete envelopes is content. Framing echoed directly
       // after a call is removed, as for Qwen calls (#383).
       const std::string full = std::move(parsed.text);
-      const auto old_spans = std::move(parsed.text_spans);
+      // A moved-from vector is valid but unspecified, not guaranteed empty;
+      // swap it with a fresh buffer before appending the rewritten spans.
+      std::vector<TextSourceSpan> old_spans;
+      old_spans.swap(parsed.text_spans);
       std::string text;
       const auto append = [&](std::string_view part) {
         text += part;
@@ -4154,9 +4150,7 @@ HttpResponse HandleOpenAiChatInputTokens(const HttpRequest& request,
 HttpResponse HandleApplyTemplate(const HttpRequest& request,
                                  TextGenerationBackend& backend) {
   ParsedChatRequest parsed;
-  if (auto error = ParseRequest(request, backend, &parsed,
-                                /*require_model=*/false);
-      error.has_value()) {
+  if (auto error = ParseRequest(request, backend, &parsed); error.has_value()) {
     return std::move(*error);
   }
   // As in llama-server, `stream` is ignored: the prompt is one JSON response.

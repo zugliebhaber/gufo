@@ -466,6 +466,23 @@ void TestResourceClaimsAreValidatedBeforeAllocation() {
          "invalid resource claim is rejected before state allocation");
 }
 
+void TestAutoSessionCountFitsBaseState() {
+  auto stats = std::make_shared<FakeStats>();
+  FakeRunner roomy(stats, 64, 256);
+  // 256 bytes / (64 state + 16 scratch) = 3 whole sessions; the widest plan
+  // is 4, so the fit is the binding limit.
+  Expect(gufo::server::AutoSessionCount(roomy) == 3,
+         "auto sessions divide the measured state capacity");
+  FakeRunner roomy_plan(stats, 64, 1000);
+  // 12 whole sessions fit the base-state claim. A paged runner may keep more
+  // sessions resident than one physical execution plan and serve them in
+  // later waves, so the plan width is not a session cap.
+  Expect(gufo::server::AutoSessionCount(roomy_plan) == 12,
+         "auto sessions follow the measured base state, not the plan width");
+  Expect(gufo::server::AutoSessionCount(roomy_plan, 2) == 2,
+         "an explicit ceiling caps auto sessions");
+}
+
 class FakeSnapshot final : public TextRunnerSnapshot {
 public:
   FakeSnapshot(std::size_t position, std::size_t decode_count,
@@ -2665,6 +2682,7 @@ int main() {
   TestRequestBindsAndClearsCancellation();
   TestBatchedAdvancePreservesIndependentRequests();
   TestResourceClaimsAreValidatedBeforeAllocation();
+  TestAutoSessionCountFitsBaseState();
   TestSnapshotForkAndUnsupportedCapabilities();
   TestSnapshotCacheBranchesOnePrefixIntoIndependentStates();
   std::ostringstream normal_log;

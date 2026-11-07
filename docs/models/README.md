@@ -25,7 +25,7 @@ features to flags; `gufo help <command>` is authoritative.
 | Goal | Start |
 | --- | --- |
 | lowest latency / one user | `--sessions 1`; Qwen3.8 27B with DFlash2, Flash-Next with MTP |
-| aggregate throughput | `--sessions 8`-`32`; Flash-Next uses a single 32-row pass |
+| aggregate throughput | `--sessions 8`-`256`; Flash-Next scales the decode plan up to 256 rows |
 | long context | `--context N`; Flash-Next above 262144 needs `--enable-yarn` |
 | restart-safe continuation | `--cache-disk DIR` with one owner per directory |
 | repeated/shared prefixes | leave `--cache-ram-bytes` at auto; report output and TTFT, not only physical tokens |

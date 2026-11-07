@@ -1,5 +1,7 @@
 # Paged live KV: design and decision
 
+> Visual companion: [shared KV cache and pagination](../KV-CACHE-VISUAL.md).
+
 Status: kernels landed, executor pool implemented and **enabled**
 (`engine.cpp` sizes `kv_pool_blocks` from the resident sessions so every
 session maps its whole context, the same memory envelope as the contiguous

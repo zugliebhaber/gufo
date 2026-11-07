@@ -1,5 +1,11 @@
 # N1-N9 batch throughput levers on gfx1151
 
+> The levers below are the November 4-5 record. The later wide MoE dispatch
+> (#28), wide expert tiles (#25) and GDN state writeback (#51) supersede their
+> decode numbers: the same 1024x16 workload reached 144.4 s / 7.09 requests/s /
+> 113.5 TG / 673.2 PP. See [BENCHMARKS](BENCHMARKS.md) and
+> [BATCH-THROUGHPUT](../../BATCH-THROUGHPUT.md).
+
 The levers below extend the A1-A4/B1-B4 set in
 `artifacts/serving/batch-pp-tg-levers.md`
 (sections 1-13). Every lever is either measured here or closed with the reason

@@ -7,14 +7,58 @@ paid once. Strix Halo (ROCm 10.1), UD-Q4_K_XL, `gufo serve --sessions 16
 --context 2048 --prefill-chunk 16384`, greedy, thinking off, cache off, two
 identical 702-token prompts, one warmup plus two measured rounds. The cohort
 path is `Executor::ForwardPrefillBatch` + `Model::PrefillBatch` + scheduler
-peer pairing, gated behind `GUFO_BATCHED_PREFILL=1`.
+peer pairing; since November 6 it is automatic (cap 32, sized from the
+prefilling queue depth).
 
 | Experiment | Outcome |
 | --- | --- |
-| Two prompts per pass, single-session wide arithmetic (`HcMix`/`Combine`/`Moe`) instead of the decode-tiled `DenseBatch` | Retained as opt-in. The first build routed the mixer projections through the eight-row decode tiling, which re-reads each 3.3 MB mixer weight 359 times at a 2870-row cohort: 3252 ms instead of the modelled 2190 ms. With the wide arithmetic the pass takes 1157/1077 ms for 2 x 702 tokens (1213/1303 tok/s) against 945 tok/s for the serial model at that length, i.e. +28-38% prefill throughput. |
+| Two prompts per pass, single-session wide arithmetic (`HcMix`/`Combine`/`Moe`) instead of the decode-tiled `DenseBatch` | Retained. The first build routed the mixer projections through the eight-row decode tiling, which re-reads each 3.3 MB mixer weight 359 times at a 2870-row cohort: 3252 ms instead of the modelled 2190 ms. With the wide arithmetic the pass takes 1157/1077 ms for 2 x 702 tokens (1213/1303 tok/s) against 945 tok/s for the serial model at that length, i.e. +28-38% prefill throughput. |
 | Output head under the decode policy, one row per item | Retained. `ForwardBody` restores the decode policy around its head; the cohort now does the same. Running it under the prompt policy changed the frontier token. |
 | Keep the fused `half_only`/`no_f32` staging | Rejected. It leaves the F32 `mixed` rows unwritten and relies on the F16 cache, which cannot be shared across per-session row views. Both paths now compute the full F32 mix; the default path stayed bit-identical (189f9e81/b9dc0063/56d2de5c/3d03cf8b) and throughput-neutral. |
-| Bit-identity of the cohort against serial prefill | Open. The cohort is plausible but not bit-identical (0882c637/938e77e0/d83ef30c/568e23bf): the wide GEMM tiles differ with the row count, so the layer-0 mixer already differs (`sumsq` 921 serial vs 1150 cohort) and greedy tokens diverge from layer 0. Bit-identity needs M-invariant row-batched GEMMs, so the path stays opt-in. |
+| Bit-identity of the cohort against serial prefill | Resolved (2026-11-06). The serial server stops chat prefill at the rendered prompt's stable-prefix boundary (23 tokens for the deterministic check) and feeds the assistant framing in a second pass. The batched path now applies the same per-item boundary. A focused probe reports bit-identical logits (`max_abs_diff=0`) across all layers, and the deterministic 256-prompt check matches serial 256/256. Batching is now automatic; cache and continuation qualification remain follow-ups. |
+
+## Automatic prefill cohorts (November 6, 2026)
+
+The scheduler now picks the prefill cohort from the prefilling queue depth:
+`min(32, queue depth)`, with no opt-in. The executor carries all handed-over
+tails in one `ForwardPrefillBatch` pass instead of the previous fixed pair.
+
+At 1024x16, same binary, cap overridden for the curve:
+
+| Cohort cap | Wall | agg TG | agg PP | HTTP |
+| ---: | ---: | ---: | ---: | --- |
+| 8 | 231.5 s | 70.8 tok/s | 419.5 tok/s | 1024/1024 |
+| 16 | 224.8 s | 72.9 tok/s | 432.0 tok/s | 1024/1024 |
+| **32** | **215.0 s** | **76.2 tok/s** | **451.7 tok/s** | 1024/1024 |
+| 64 | 235.9 s | 69.5 tok/s | 412.0 tok/s | 1024/1024 |
+| 128 | 234.6 s | 69.8 tok/s | 414.2 tok/s | 1024/1024 |
+
+The automatic default (cap 32) reproduced 214.4 s / 76.4 TG / 453.3 PP. With
+8, 20 and 1 requests open the scheduler formed cohorts of 8, 20 and none, and
+all responses matched serial. Deterministic 256-prompt checks were 256/256
+identical for cohort 8, 16 and 32. `GUFO_BATCHED_PREFILL=0` remains only as a
+diagnostics kill switch for matched serial A/B runs.
+
+### TG effect
+
+The same cohort path also changes decode width. At 1024x32, serial prefill
+decoded in ~31-row batches (56.6 TG, 575.0 s), while automatic cohorts decoded
+256 rows (99.9 TG, 326.8 s); TTFT p50 fell from 288 to 119 s. Holding the
+decode ceiling at 32 rows under automatic prefill gives 94.4 TG, so the
+256-row decode cohort contributes 5.8 % TG. At 256x128-token budget the decode-dominated
+run moves from 68.5 to 110.0 TG (+60.6 %) and 142.4 to 225.1 PP. Per-request
+decode speed falls (0.7 vs 4.4 tok/s at 1024x32) because 256 streams share the
+GPU; aggregate TG, wall and TTFT improve.
+
+## Decode tile ladder (November 6, 2026)
+
+The decode projections use the MMVQ dispatcher's 1-32 row wave path and the
+16/32/48-token matrix kernel; the fixed eight-row launch split is gone.
+At 8k+1 ready rows the scheduler defers one row one step and runs 8/16/24/32
+full tiles. The repeatable dips at 9/17/25/33 disappear (9: 209.9 -> 212-214,
+17: 249.6 -> 259, 25: 261.9 -> 276, 33: 265.5 -> 283 PP/s), while the
+1024x16 reference improves to 209.9 s / 78.1 TG / 462.9 PP and the
+256-prompt deterministic check remains 256/256.
 
 ## Confidence-gated MTP chains (October 29, 2026)
 

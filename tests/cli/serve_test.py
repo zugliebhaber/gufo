@@ -36,7 +36,7 @@ def main():
             check(["serve", "--sessions", "2", modality], 2, "Unknown option")
         else:
             check(["serve", modality, "--sessions", "0"], 2,
-                  "server limits must be positive")
+                  "--sessions must be a positive integer or auto")
         check(["serve", modality, "unexpected"], 2, "Unexpected argument")
         check(["serve", modality, "--port", "65536"], 2, "--port must")
         check(["serve", modality, "--host", "bad.address"], 2, "--host must")

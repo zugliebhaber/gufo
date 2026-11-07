@@ -32,6 +32,7 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/generator.hpp"
+#include "src/models/qwen/kv_blocks.hpp"
 #include "src/models/qwen/vision/image_cache.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -71,6 +72,24 @@ void SetError(std::string* error, std::string message) {
 }
 
 #if defined(ENGINE_ENABLE_HIP)
+
+/// Plan-width ceiling. The scheduler already selects the largest plan the
+/// resident cohort can fill, so advertising all widths is inherently hybrid.
+/// GUFO_DECODE_MAX_ROWS narrows the ceiling for A/B runs.
+std::uint32_t DecodePlanLimit() {
+  static const std::uint32_t limit = [] {
+    const char* text = std::getenv("GUFO_DECODE_MAX_ROWS");
+    if (text == nullptr || *text == '\0')
+      return models::qwen38_flash_next::kMaxBatchSessions;
+    char* end = nullptr;
+    const auto parsed = std::strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || parsed < 1)
+      return models::qwen38_flash_next::kMaxBatchSessions;
+    return static_cast<std::uint32_t>(std::min<unsigned long>(
+        parsed, models::qwen38_flash_next::kMaxBatchSessions));
+  }();
+  return limit;
+}
 
 struct QwenImageContext final : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
@@ -1215,7 +1234,8 @@ public:
     // Report actual session widths, including C6. The widest plan this dense
     // path advertises is eight rows: a sixteen-row plan split the K-quant
     // attention projections into two eight-row passes and lost 3-6% aggregate
-    // throughput. Flash-Next has its own plan set and goes to 32 rows.
+    // throughput. Flash-Next has its own plan set and advertises up to 256
+    // rows, selected by the resident cohort.
     for (std::size_t width = 2; width <= MaximumDecodeBatchWidth(); ++width) {
       plans.push_back({
           .kind = TextExecutionPlanKind::kBatched,
@@ -2570,6 +2590,13 @@ public:
       const auto deferred = model_->DeferredScratchBytes();
       capacity = free_bytes > deferred ? free_bytes - deferred : 0;
     }
+    std::optional<std::size_t> shared_capacity;
+    std::optional<std::size_t> shared_free;
+    if (const auto pool = model_->KvPoolSnapshot()) {
+      const auto block = std::size_t{models::qwen::kKvBlockTokens};
+      shared_capacity = std::size_t{pool->capacity_blocks} * block;
+      shared_free = std::size_t{pool->free_blocks} * block;
+    }
     // Admission charges complete snapshot payloads. Flash-Next can retain
     // mutable state and protected K/V rows in private device storage.
     return {
@@ -2584,6 +2611,9 @@ public:
         .temporary_scratch_bytes = 0,
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
         .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
+        .shared_kv_capacity_tokens = shared_capacity,
+        .shared_kv_free_tokens = shared_free,
+        .shared_kv_block_tokens = std::size_t{models::qwen::kKvBlockTokens},
         .requires_device_runtime_lock = true,
     };
   }
@@ -2591,11 +2621,11 @@ public:
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
     std::vector<TextExecutionPlan> plans{
         {.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
-    // A thirty-two-row plan covers a full thirty-two-session pool in one
-    // physical pass. kMaxBatchSessions bounds the batched executor, so the
-    // advertised widths stop there.
-    for (std::size_t width = 2;
-         width <= models::qwen38_flash_next::kMaxBatchSessions; ++width) {
+    // Advertise the executor's full capacity. The scheduler still selects the
+    // largest plan the resident cohort can fill, so narrow loads keep narrow
+    // physical passes while a wide auto-session pool uses the wide plans.
+    const auto limit = DecodePlanLimit();
+    for (std::size_t width = 2; width <= limit; ++width) {
       plans.push_back(
           {.kind = TextExecutionPlanKind::kBatched, .physical_width = width});
     }
@@ -3320,6 +3350,12 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       return false;
     }
     // The model owns prefill geometry for both bulk and scheduled requests.
+    // Auto sessions are resolved only after the runner reports its measured
+    // state capacity, so size the executor pool for the widest qualified plan
+    // now. Leaving zero here would make a one-session pool whose cache could
+    // lend away every block before the server learns it may admit more.
+    const std::size_t model_session_count =
+        session_count == 0 ? std::size_t{32} : session_count;
     auto model = models::qwen38_flash_next::Model::Load(
         model_path,
         models::qwen38_flash_next::ModelOptions{
@@ -3331,9 +3367,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .max_draft_tokens = speculative_config.max_draft_tokens,
             .vision_model_path = vision_model_path,
             .decode_concurrency = static_cast<std::uint32_t>(
-                std::clamp<std::size_t>(session_count, 1, 8)),
-            .pool_sessions = static_cast<std::uint32_t>(session_count),
+                std::clamp<std::size_t>(model_session_count, 1, 8)),
+            .pool_sessions = static_cast<std::uint32_t>(model_session_count),
             .kv_pool_budget_bytes = kv_pool_budget_bytes,
+            .device_row_lending = session_count != 0,
             .rope_scaling = rope_scaling,
         },
         &load_error);
@@ -3455,10 +3492,9 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     SetError(error, "MTP HTTP decoding requires a Qwen Flash-Next model");
     return false;
   }
-  if (session_count == 0) {
-    SetError(error, "HTTP session count must be at least one");
-    return false;
-  }
+  // Zero selects auto sizing after the model is resident. The effective
+  // count is resolved from the runner's own full-context resource claim.
+  const bool auto_sessions = session_count == 0;
   if (DiskCacheEnabled(disk_cache_config) &&
       (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
        (!disk_cache_config.draft_model_artifact_fingerprint.empty() &&
@@ -3556,6 +3592,20 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     }
     Logger::Info("loader",
                  "event=load_phase phase=sessions " + Logger::MemoryStatus());
+    if (auto_sessions) {
+      const auto claim = runner->ResourceClaim();
+      session_count = AutoSessionCount(*runner);
+      scheduler_policy.auto_sessions = true;
+      Logger::Info(
+          "loader",
+          "event=auto_sessions value=" + std::to_string(session_count) +
+              " policy=base-state-fit base_state_bytes=" +
+              std::to_string(claim.per_request_state_bytes.value_or(0)) +
+              " state_capacity_bytes=" +
+              std::to_string(claim.state_capacity_bytes.value_or(0)) +
+              " shared_kv_tokens=" +
+              std::to_string(claim.shared_kv_capacity_tokens.value_or(0)));
+    }
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
@@ -3593,10 +3643,9 @@ bool InferenceBackend::load(
     SetError(error, "DeepSeek DSpark requires a loaded support model");
     return false;
   }
-  if (session_count == 0) {
-    SetError(error, "HTTP session count must be at least one");
-    return false;
-  }
+  // Zero selects auto sizing after the model is resident. The effective
+  // count is resolved from the runner's own full-context resource claim.
+  const bool auto_sessions = session_count == 0;
   if (max_context > model->MaxContext()) {
     SetError(error, "HTTP context exceeds the loaded DeepSeek model context");
     return false;
@@ -3643,6 +3692,20 @@ bool InferenceBackend::load(
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
       };
     }
+    if (auto_sessions) {
+      const auto claim = runner->ResourceClaim();
+      session_count = AutoSessionCount(*runner);
+      scheduler_policy.auto_sessions = true;
+      Logger::Info(
+          "loader",
+          "event=auto_sessions value=" + std::to_string(session_count) +
+              " policy=base-state-fit base_state_bytes=" +
+              std::to_string(claim.per_request_state_bytes.value_or(0)) +
+              " state_capacity_bytes=" +
+              std::to_string(claim.state_capacity_bytes.value_or(0)) +
+              " shared_kv_tokens=" +
+              std::to_string(claim.shared_kv_capacity_tokens.value_or(0)));
+    }
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
@@ -3673,10 +3736,9 @@ bool InferenceBackend::load(
   if (max_context == 0)
     max_context = model->MaxContext();
 
-  if (session_count == 0) {
-    SetError(error, "HTTP session count must be at least one");
-    return false;
-  }
+  // Zero selects auto sizing after the model is resident. The effective
+  // count is resolved from the runner's own full-context resource claim.
+  const bool auto_sessions = session_count == 0;
   if (max_context == 0 || max_context > model->MaxContext()) {
     SetError(
         error,
@@ -3729,6 +3791,20 @@ bool InferenceBackend::load(
           .capacity_bytes = disk_cache_config.capacity_bytes,
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
       };
+    }
+    if (auto_sessions) {
+      const auto claim = runner->ResourceClaim();
+      session_count = AutoSessionCount(*runner);
+      scheduler_policy.auto_sessions = true;
+      Logger::Info(
+          "loader",
+          "event=auto_sessions value=" + std::to_string(session_count) +
+              " policy=base-state-fit base_state_bytes=" +
+              std::to_string(claim.per_request_state_bytes.value_or(0)) +
+              " state_capacity_bytes=" +
+              std::to_string(claim.state_capacity_bytes.value_or(0)) +
+              " shared_kv_tokens=" +
+              std::to_string(claim.shared_kv_capacity_tokens.value_or(0)));
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
