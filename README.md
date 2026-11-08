@@ -456,9 +456,9 @@ This is a completed benchmark run, not the live server log. The columns are:
 - `fail` — failed requests, `cache` — cache hits.
 
 The live server prints a 10 s interval table with `win pp/s` / `win tg/s`,
-`adm` (newly accepted requests) and `done` (finished requests) counts and
-`win s`; every row is the delta since the previous row, so idle rows report
-zero rather than the run average.
+`adm` (newly accepted requests), `done` (finished requests), `win s` and
+`ctx%` (used shared KV-pool memory); every row is the delta since the previous
+row, so idle rows report zero rather than the run average.
 
 ```text
 conc |  pp/s req  tg/s req  TTFT ms |  tot pp/s  tot tg/s   req/s  wall s  fail  cache

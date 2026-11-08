@@ -328,8 +328,9 @@ These apply to every modality, before or after the subcommand:
   separate, opt-in `trace` file records content. Debug admission lines do name
   the client by the peer IP address of its connection. At INFO, text serving
   emits a 10 s interval table (every row is the delta since the previous row)
-  with `adm` for newly accepted and `done` for finished request counts, plus a
-  once-per-minute completed-request line; per-request receipt/completion,
+  with `adm` for newly accepted, `done` for finished request counts and `ctx%`
+  for shared KV-pool usage, plus a once-per-minute completed-request line;
+  per-request receipt/completion,
   scheduler batch/prefill and cache acquire/retention lines are DEBUG. See
   [server logs](SERVER.md#troubleshooting-logs).
 

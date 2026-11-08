@@ -115,6 +115,72 @@ inline std::atomic<std::uint64_t>& TotalKvDeferrals() {
   static std::atomic<std::uint64_t> count{0};
   return count;
 }
+// Requests accepted by the scheduler, including requests that wait in the
+// pending queue. The interval delta is the log's `adm` count.
+inline std::atomic<std::uint64_t>& TotalRequestsAdmitted() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+// Shared paged-KV pool in tokens, refreshed by the scheduler thread. The
+// scheduler owns the pool snapshot; other threads only read these atomics.
+inline std::atomic<std::uint64_t>& KvPoolCapacityTokens() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<std::uint64_t>& KvPoolFreeTokens() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<std::uint64_t>& KvPoolBlockTokens() {
+  static std::atomic<std::uint64_t> count{1};
+  return count;
+}
+// Latest 10 s interval row, published by LogStats. These gauges mirror the
+// application log fields exactly and let a scrape read the same snapshot.
+inline std::atomic<std::int64_t>& LastStatsConcurrency() {
+  static std::atomic<std::int64_t> value{0};
+  return value;
+}
+inline std::atomic<double>& LastStatsPromptPerRequest() {
+  static std::atomic<double> value{0.0};
+  return value;
+}
+inline std::atomic<double>& LastStatsGeneratedPerRequest() {
+  static std::atomic<double> value{0.0};
+  return value;
+}
+inline std::atomic<double>& LastStatsTtftSeconds() {
+  static std::atomic<double> value{0.0};
+  return value;
+}
+inline std::atomic<double>& LastStatsPromptThroughput() {
+  static std::atomic<double> value{0.0};
+  return value;
+}
+inline std::atomic<double>& LastStatsGeneratedThroughput() {
+  static std::atomic<double> value{0.0};
+  return value;
+}
+inline std::atomic<std::uint64_t>& LastStatsAdmitted() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+inline std::atomic<std::uint64_t>& LastStatsDone() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+inline std::atomic<double>& LastStatsIntervalSeconds() {
+  static std::atomic<double> value{0.0};
+  return value;
+}
+inline std::atomic<std::uint64_t>& LastStatsFailed() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+inline std::atomic<std::uint64_t>& LastStatsCacheHits() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
 // Finished-request outcomes. A request lands in exactly one bucket: completed
 // and cancelled are recorded by RecordRequestMetrics, failures by
 // RecordFailedRequest. Failed requests also keep the token counters of the

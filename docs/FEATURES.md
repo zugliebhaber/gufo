@@ -457,11 +457,12 @@ endpoints.
   concurrency for a model. Purpose: find the batch knee without a bespoke
   harness. Evidence: the two scripts and `PROGRESS.md` `TP-P1`.
 - **Periodic text statistics.** Text serving logs a 10 s interval table
-  (`conc | pp/s req tg/s req TTFT | win pp/s win tg/s adm done win s fail cache`)
+  (`conc | pp/s req tg/s req TTFT | win pp/s win tg/s adm done win s ctx% fail cache`)
   and a once-per-minute completed-request line. Every row reports the
   difference from the previous snapshot, so idle rows show zero rather than
   lifetime averages. `conc` is the live count, `adm` counts newly accepted
-  requests and `done` counts finished requests in the interval. The table
+  requests, `done` counts finished requests in the interval and `ctx%` is the
+  used shared KV-pool memory over capacity. The table
   header follows the minute line; per-request receipt/completion, scheduler
   batch/prefill and cache acquire/retention details move to DEBUG. Purpose:
   keep the log vLLM-like and correlate the shared pool with interval

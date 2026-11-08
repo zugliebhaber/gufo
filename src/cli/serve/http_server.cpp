@@ -1804,6 +1804,62 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
         "excludes retained cache",
         KvCacheUsageRatio(b));
 
+  const auto kv_pool_capacity =
+      detail::KvPoolCapacityTokens().load(std::memory_order_relaxed);
+  const auto kv_pool_free =
+      detail::KvPoolFreeTokens().load(std::memory_order_relaxed);
+  const auto kv_pool_used =
+      kv_pool_capacity > kv_pool_free ? kv_pool_capacity - kv_pool_free : 0;
+  const double kv_pool_used_ratio =
+      kv_pool_capacity > 0 ? static_cast<double>(kv_pool_used) /
+                                 static_cast<double>(kv_pool_capacity)
+                           : 0.0;
+  gauge("gufo_kv_pool_capacity_tokens",
+        "Shared paged-KV pool capacity in tokens", kv_pool_capacity);
+  gauge("gufo_kv_pool_free_tokens", "Shared paged-KV pool free tokens",
+        kv_pool_free);
+  gauge("gufo_kv_pool_used_tokens", "Shared paged-KV pool used tokens",
+        kv_pool_used);
+  gauge("gufo_kv_pool_block_tokens", "Tokens per shared KV block",
+        detail::KvPoolBlockTokens().load(std::memory_order_relaxed));
+  gauge("gufo_kv_pool_used_ratio", "Used shared KV-pool tokens over capacity",
+        kv_pool_used_ratio);
+  gauge("gufo_kv_pool_used_percent",
+        "Used shared KV-pool memory as a percentage",
+        100.0 * kv_pool_used_ratio);
+
+  counter("gufo_requests_admitted_total",
+          "Requests accepted by the scheduler, including queued requests",
+          detail::TotalRequestsAdmitted().load(std::memory_order_relaxed));
+  gauge("gufo_stats_concurrency", "Latest 10 s interval concurrency",
+        detail::LastStatsConcurrency().load(std::memory_order_relaxed));
+  gauge("gufo_stats_prompt_tokens_per_second_per_request",
+        "Latest interval prompt tokens per second per completed request",
+        detail::LastStatsPromptPerRequest().load(std::memory_order_relaxed));
+  gauge("gufo_stats_generated_tokens_per_second_per_request",
+        "Latest interval generated tokens per second per completed request",
+        detail::LastStatsGeneratedPerRequest().load(std::memory_order_relaxed));
+  gauge("gufo_stats_ttft_seconds",
+        "Latest interval average time to first token",
+        detail::LastStatsTtftSeconds().load(std::memory_order_relaxed));
+  gauge("gufo_stats_prompt_tokens_per_second",
+        "Latest interval aggregate prompt tokens per second",
+        detail::LastStatsPromptThroughput().load(std::memory_order_relaxed));
+  gauge("gufo_stats_generated_tokens_per_second",
+        "Latest interval aggregate generated tokens per second",
+        detail::LastStatsGeneratedThroughput().load(std::memory_order_relaxed));
+  gauge("gufo_stats_admitted", "Latest interval admitted request count",
+        detail::LastStatsAdmitted().load(std::memory_order_relaxed));
+  gauge("gufo_stats_done", "Latest interval finished request count",
+        detail::LastStatsDone().load(std::memory_order_relaxed));
+  gauge("gufo_stats_interval_seconds",
+        "Latest statistics interval duration in seconds",
+        detail::LastStatsIntervalSeconds().load(std::memory_order_relaxed));
+  gauge("gufo_stats_failed", "Latest interval failed request count",
+        detail::LastStatsFailed().load(std::memory_order_relaxed));
+  gauge("gufo_stats_cache_hits", "Latest interval prefix-cache hit count",
+        detail::LastStatsCacheHits().load(std::memory_order_relaxed));
+
   const auto completed =
       detail::TotalRequestsCompleted().load(std::memory_order_relaxed);
   const auto cancelled =

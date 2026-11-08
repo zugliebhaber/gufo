@@ -586,10 +586,30 @@ void TestPrometheusMetrics() {
     assert(response.find(name + "_count ") != std::string::npos);
   }
   for (const std::string gauge :
-       {"gufo_sessions_capacity", "gufo_sessions_active", "gufo_context_tokens",
+       {"gufo_sessions_capacity",
+        "gufo_sessions_active",
+        "gufo_context_tokens",
         "gufo_process_resident_memory_bytes",
-        "gufo_host_available_memory_bytes", "gufo_prefix_cache_hit_rate",
-        "gufo_kv_cache_usage_ratio"}) {
+        "gufo_host_available_memory_bytes",
+        "gufo_prefix_cache_hit_rate",
+        "gufo_kv_cache_usage_ratio",
+        "gufo_kv_pool_capacity_tokens",
+        "gufo_kv_pool_free_tokens",
+        "gufo_kv_pool_used_tokens",
+        "gufo_kv_pool_block_tokens",
+        "gufo_kv_pool_used_ratio",
+        "gufo_kv_pool_used_percent",
+        "gufo_stats_concurrency",
+        "gufo_stats_prompt_tokens_per_second_per_request",
+        "gufo_stats_generated_tokens_per_second_per_request",
+        "gufo_stats_ttft_seconds",
+        "gufo_stats_prompt_tokens_per_second",
+        "gufo_stats_generated_tokens_per_second",
+        "gufo_stats_admitted",
+        "gufo_stats_done",
+        "gufo_stats_interval_seconds",
+        "gufo_stats_failed",
+        "gufo_stats_cache_hits"}) {
     assert(response.find("# TYPE " + gauge + " gauge\n") != std::string::npos);
   }
   assert(response.find("gufo_sessions_capacity 2\n") != std::string::npos);
@@ -598,7 +618,8 @@ void TestPrometheusMetrics() {
   for (const std::string counter :
        {"gufo_prompt_tokens_total", "gufo_prompt_tokens_cached_total",
         "gufo_tokens_generated_total", "gufo_requests_total",
-        "gufo_prefix_cache_hits_total", "gufo_spec_draft_rounds_total"}) {
+        "gufo_requests_admitted_total", "gufo_prefix_cache_hits_total",
+        "gufo_spec_draft_rounds_total"}) {
     assert(response.find("# TYPE " + counter + " counter\n") !=
            std::string::npos);
   }

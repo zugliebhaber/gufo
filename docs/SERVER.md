@@ -1616,6 +1616,9 @@ requests, from submission to first and last generated token.
 `gufo_sessions_capacity`, `gufo_sessions_active` and `gufo_context_tokens`
 describe the session pool, and `gufo_process_resident_memory_bytes` and
 `gufo_host_available_memory_bytes` report process and unified-memory headroom.
+`gufo_requests_admitted_total` counts accepted requests. `gufo_kv_pool_*`
+reports actual shared-KV-pool capacity, free/used tokens and utilization;
+`gufo_stats_*` gauges mirror every numeric field of the latest 10 s log row.
 The `llamacpp:*` families remain for llama.cpp-compatible tooling.
 `Server-Timing`, generation `timings`, and Chat Completions `usage.gufo`
 provide request-level measurements.
@@ -1673,7 +1676,7 @@ level.
 
 Text inference no longer writes one INFO line per request. At INFO it emits a
 **10 s interval table** (`conc | pp/s req tg/s req TTFT ms | win pp/s win
-tg/s adm done win s fail cache`) and a **once-per-minute completed-request
+tg/s adm done win s ctx% fail cache`) and a **once-per-minute completed-request
 line** listing the request IDs with `ok`, `cancel` or `fail`. Every numeric
 table column is the difference between two consecutive snapshots: an idle row
 therefore reports zeros instead of the lifetime average. The `win` columns are
@@ -1681,10 +1684,11 @@ the aggregate prompt and generated token throughput over that interval;
 `adm` is the number of requests newly accepted by the scheduler, including
 requests that wait in the pending queue; `done` is the number of finished
 requests, including cancelled and failed ones; `win s` is the interval
-duration; `fail` and `cache` count failures and prefix-cache hits in the
-interval. `conc` remains the live count of requests currently being processed,
-so a row can have `conc > 0` while `done = 0` and `adm = 0` when admitted
-requests are still running. The table header is printed only after a minute request line, so the
+duration; `ctx%` is the used shared KV-pool memory over its capacity; `fail`
+and `cache` count failures and prefix-cache hits in the interval. `conc`
+remains the live count of requests currently being processed, so a row can
+have `conc > 0` while `done = 0` and `adm = 0` when admitted requests are still
+running. The table header is printed only after a minute request line, so the
 10 s rows between minute boundaries carry data without repeating the header.
 Routine scheduler and cache detail stays at DEBUG: batch-limit changes,
 batched prefill widths, cache acquire/retention events and per-request

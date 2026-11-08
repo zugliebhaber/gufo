@@ -69,6 +69,7 @@ config identifies it.
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `gufo_requests_total{status}` | counter | Finished text-generation requests. `status` is `completed`, `cancelled` or `failed`; each recorded request lands in exactly one status. Malformed HTTP requests rejected before generation are not counted. |
+| `gufo_requests_admitted_total` | counter | Requests accepted by the scheduler, including requests that wait in the pending queue. |
 | `gufo_ttft_seconds` | histogram | Submission to first generated token, for completed requests. Includes queueing and cache restore. |
 | `gufo_request_duration_seconds` | histogram | Submission to last generated token, for completed requests. |
 | `gufo_requests_processing` | gauge | Admitted requests holding or preparing a session, including cache cleanup. Matches the busy `/slots` entries. |
@@ -115,6 +116,12 @@ The prebuilt `gufo_prefix_cache_hit_rate` gauge computes the same ratio.
 | `gufo_prefix_cache_misses_total` | counter | Completed requests that prefilled their whole prompt. |
 | `gufo_prefix_cache_hit_rate` | gauge | Cached prompt tokens over all prompt tokens seen by this process. |
 | `gufo_kv_cache_usage_ratio` | gauge | In-flight prompt and generated tokens over sessions times context. Retained cache entries are not counted. |
+| `gufo_kv_pool_capacity_tokens` | gauge | Shared paged-KV pool capacity in tokens. |
+| `gufo_kv_pool_free_tokens` | gauge | Shared paged-KV pool tokens still free. |
+| `gufo_kv_pool_used_tokens` | gauge | `capacity - free` for the shared paged-KV pool. |
+| `gufo_kv_pool_block_tokens` | gauge | Tokens per shared KV block. |
+| `gufo_kv_pool_used_ratio` | gauge | Used shared KV-pool tokens over capacity, in the range 0 to 1. This is the log's `ctx% / 100`. |
+| `gufo_kv_pool_used_percent` | gauge | The same shared KV-pool utilization as a percentage, 0 to 100. |
 | `gufo_kv_limited_total` | counter | Prefill chunks whose size was set by free KV capacity instead of the batched-token budget. |
 | `gufo_kv_deferred_total` | counter | Requests degraded to their retained host snapshot when the device KV pool refused blocks. |
 | `gufo_preemptions_total` | counter | Model states released for RECOMPUTE preemption. |
@@ -131,6 +138,29 @@ counts the prompt and generated tokens held by active sessions, divided by
 retained host checkpoints and the block pool's free-block distribution. Use
 the block-pool figures in `usage.gufo` for per-request cache diagnosis and the
 KV pressure counters above for alerting.
+
+## Latest interval log snapshot
+
+The `gufo_stats_*` gauges publish the exact numbers of the latest 10 s log row.
+They are snapshots, not counters; use the counters above for rates and totals.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `gufo_stats_concurrency` | gauge | `conc` from the latest row. |
+| `gufo_stats_prompt_tokens_per_second_per_request` | gauge | `pp/s req` from the latest row. |
+| `gufo_stats_generated_tokens_per_second_per_request` | gauge | `tg/s req` from the latest row. |
+| `gufo_stats_ttft_seconds` | gauge | `TTFT ms / 1000` from the latest row. |
+| `gufo_stats_prompt_tokens_per_second` | gauge | `win pp/s` from the latest row. |
+| `gufo_stats_generated_tokens_per_second` | gauge | `win tg/s` from the latest row. |
+| `gufo_stats_admitted` | gauge | `adm` from the latest row. |
+| `gufo_stats_done` | gauge | `done` from the latest row. |
+| `gufo_stats_interval_seconds` | gauge | `win s` from the latest row. |
+| `gufo_stats_failed` | gauge | `fail` from the latest row. |
+| `gufo_stats_cache_hits` | gauge | `cache` from the latest row. |
+
+The log's `ctx%` is `100 * gufo_kv_pool_used_ratio` and is also available
+directly as `gufo_kv_pool_used_percent`. Together with the counters above,
+these gauges cover every numeric column of the 10 s log row.
 
 ## Process and device metrics
 
@@ -254,6 +284,8 @@ Session utilization and KV pressure:
 ```promql
 gufo_sessions_active / gufo_sessions_capacity
 gufo_kv_cache_usage_ratio
+gufo_kv_pool_used_ratio
+gufo_kv_pool_used_percent
 sum(rate(gufo_kv_limited_total[5m]))
 sum(rate(gufo_kv_deferred_total[5m]))
 sum(rate(gufo_preemptions_total[5m]))

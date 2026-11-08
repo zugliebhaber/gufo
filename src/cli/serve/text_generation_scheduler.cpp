@@ -1863,11 +1863,36 @@ struct TextGenerationScheduler::Impl {
     PublishTerminal(request);
   }
 
+  /// Refreshes the process-wide KV-pool gauges once per second. The scheduler
+  /// thread owns the pool snapshot; the statistics thread only reads atomics.
+  void UpdateKvPoolGauges() noexcept {
+    const auto now = Clock::now();
+    if (last_kv_gauge_update != Clock::time_point{} &&
+        now - last_kv_gauge_update < std::chrono::seconds(1))
+      return;
+    last_kv_gauge_update = now;
+    try {
+      const auto pool = SharedKvPool();
+      if (!pool) {
+        detail::KvPoolCapacityTokens().store(0, std::memory_order_relaxed);
+        detail::KvPoolFreeTokens().store(0, std::memory_order_relaxed);
+        return;
+      }
+      detail::KvPoolCapacityTokens().store(pool->capacity,
+                                           std::memory_order_relaxed);
+      detail::KvPoolFreeTokens().store(pool->free, std::memory_order_relaxed);
+      detail::KvPoolBlockTokens().store(pool->block, std::memory_order_relaxed);
+    } catch (...) {
+      // Pool gauges are best effort and must not fail scheduler work.
+    }
+  }
+
   /// Counts one request accepted by Submit. This is the arrival count shown as
   /// `adm`; actual session admission can happen later behind the queue.
   void RecordAdmissionStats() noexcept {
     if (!scheduler_policy.log_stats)
       return;
+    detail::TotalRequestsAdmitted().fetch_add(1, std::memory_order_relaxed);
     try {
       std::lock_guard<std::mutex> lock(stats_mutex);
       ++stats_admitted;
@@ -1989,8 +2014,6 @@ struct TextGenerationScheduler::Impl {
     }
     const auto previous = stats_last;
     stats_last = current;
-    if (!Logger::Enabled(LogLevel::kInfo))
-      return;
 
     const auto delta = [](std::uint64_t now, std::uint64_t before) {
       return now >= before ? now - before : 0;
@@ -2035,14 +2058,47 @@ struct TextGenerationScheduler::Impl {
             : 0.0;
     const auto concurrency = std::max<std::int64_t>(
         0, detail::RequestsProcessing().load(std::memory_order_relaxed));
+    const auto pool_capacity =
+        detail::KvPoolCapacityTokens().load(std::memory_order_relaxed);
+    const auto pool_free =
+        detail::KvPoolFreeTokens().load(std::memory_order_relaxed);
+    const auto pool_used =
+        pool_capacity > pool_free ? pool_capacity - pool_free : 0;
+    const double context_used_ratio =
+        pool_capacity > 0 ? static_cast<double>(pool_used) /
+                                static_cast<double>(pool_capacity)
+                          : 0.0;
+    const double context_used_percent = 100.0 * context_used_ratio;
+
+    detail::LastStatsConcurrency().store(concurrency,
+                                         std::memory_order_relaxed);
+    detail::LastStatsPromptPerRequest().store(pp_request,
+                                              std::memory_order_relaxed);
+    detail::LastStatsGeneratedPerRequest().store(tg_request,
+                                                 std::memory_order_relaxed);
+    detail::LastStatsTtftSeconds().store(ttft / 1000.0,
+                                         std::memory_order_relaxed);
+    detail::LastStatsPromptThroughput().store(total_pp,
+                                              std::memory_order_relaxed);
+    detail::LastStatsGeneratedThroughput().store(total_tg,
+                                                 std::memory_order_relaxed);
+    detail::LastStatsAdmitted().store(admitted, std::memory_order_relaxed);
+    detail::LastStatsDone().store(finished, std::memory_order_relaxed);
+    detail::LastStatsIntervalSeconds().store(interval,
+                                             std::memory_order_relaxed);
+    detail::LastStatsFailed().store(failed, std::memory_order_relaxed);
+    detail::LastStatsCacheHits().store(cache_hits, std::memory_order_relaxed);
+
+    if (!Logger::Enabled(LogLevel::kInfo))
+      return;
     if (header) {
       Logger::Info(
           "stats",
           "conc |  pp/s req  tg/s req  TTFT ms |  win pp/s  win tg/s    adm   "
-          "done  win s  fail  cache");
+          "done  win s  ctx%  fail  cache");
       Logger::Info("stats",
                    "-----------------------------------------------------------"
-                   "-----------------------------------");
+                   "-----------------------------------------");
     }
     std::ostringstream out;
     out << std::fixed << std::setprecision(1) << std::setw(4) << concurrency
@@ -2050,8 +2106,9 @@ struct TextGenerationScheduler::Impl {
         << std::setw(9) << std::setprecision(0) << ttft << " | " << std::setw(9)
         << std::setprecision(1) << total_pp << std::setw(9) << total_tg
         << std::setw(7) << admitted << std::setw(7) << finished << std::setw(7)
-        << std::setprecision(2) << interval << std::setw(5) << failed
-        << std::setw(6) << cache_hits;
+        << std::setprecision(2) << interval << std::setw(6)
+        << std::setprecision(1) << context_used_percent << std::setw(5)
+        << failed << std::setw(6) << cache_hits;
     Logger::Info("stats", out.str());
   }
 
@@ -3314,6 +3371,7 @@ struct TextGenerationScheduler::Impl {
     while (!stop_token.stop_requested()) {
       if (device_lost.load(std::memory_order_acquire))
         break;
+      UpdateKvPoolGauges();
       loop_working.store(true, std::memory_order_relaxed);
       ProcessQueuedCancellations();
       ProcessCoalescedFollowers(prefilling, decoding, capturing);
@@ -3598,6 +3656,8 @@ struct TextGenerationScheduler::Impl {
   // completes makes no progress.
   std::atomic<std::uint64_t> progress{0};
   std::atomic<bool> loop_working{false};
+  /// Scheduler-thread throttle for the process-wide KV-pool gauges.
+  std::chrono::steady_clock::time_point last_kv_gauge_update{};
   // Periodic vLLM-style summary. The scheduler thread records finished
   // requests; stats_monitor snapshots once per 10 s and once per minute.
   mutable std::mutex stats_mutex;
