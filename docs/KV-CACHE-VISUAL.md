@@ -475,7 +475,7 @@ cache backing, transfer streams and allocator fragmentation; the second bound
 controls in-flight KV. They are intentionally separate: a session owns its
 block table and index, not the KV rows it maps later.
 
-### Worked example: 96 sessions at 250k
+### Worked example: uncapped 96-session fit at 250k
 
 | quantity | value |
 | --- | ---: |
@@ -486,10 +486,12 @@ block table and index, not the KV rows it maps later.
 | 512 MiB requested pool, floored to one context | 1,954 blocks |
 | base state per session | about 290 MiB |
 | measured state capacity | about 36.6 GiB |
-| auto sessions after 25 % reserve | 96 |
+| uncapped auto fit after 25 % reserve | 96 |
+| effective auto sessions (hard cap) | 64 |
 
-The pool holds about **one full 250k context**, not 96. The 96 sessions are
-admitted because each owns only about 290 MiB of base state; KV blocks map
+The pool holds about **one full 250k context**, not 96. The uncapped fit is 96
+sessions, but current builds hard-cap autoscaling at 64; each session is
+admitted because it owns only about 290 MiB of base state, and KV blocks map
 lazily from the shared pool as prompts and outputs grow. Medium-length chats
 share the pool comfortably. If the pool does fill, admission holds new
 requests and KV exhaustion defers a resident request instead of allocating

@@ -134,11 +134,11 @@ the pool at the widest execution plan: a wider pool serves additional sessions
 in later decode waves. The resolved count is logged at startup as
 `event=auto_sessions value=N policy=base-state-fit ... base_state_bytes=...
 state_capacity_bytes=... shared_kv_tokens=...` and repeated in
-`load_completed` as `sessions=auto(N)`. `GUFO_AUTO_SESSIONS_MAX=N` caps the
-resolved count (default 256, or the memory fit when it is lower); the
-64-session deployment in this tree sets it to 64. On this 128 GiB Strix Halo, Qwen3.8
-Flash-Next resolves to **150 sessions at 128k** and **96 at 250k**, so the
-hybrid plan reaches 150 or 96 rows instead of the former 32-row control.
+`load_completed` as `sessions=auto(N)`. Autoscaling is hard-capped at **64
+sessions**; `GUFO_AUTO_SESSIONS_MAX=N` may lower that ceiling but never raise
+it. On this 128 GiB Strix Halo the uncapped base-state fit is **150 sessions
+at 128k** and **96 at 250k**, so the effective auto pool is 64 and the hybrid
+plan uses at most 64 rows.
 
 The scheduler starts with one resident session and grows toward visible demand
 while the shared KV pool has room. The admission estimate for a request is its
@@ -174,15 +174,16 @@ servers keep their own fixed queues and do not accept `--sessions auto`.
 The 2026-11-05 build, which still sized by full context, resolved 12 sessions
 at 128k; its bounded sweep is retained in [the Flash-Next auto-session
 benchmark](models/qwen3.8-flash-next/BENCHMARKS.md#auto-sessions-at-128k-2026-11-05).
-With base-state sizing, a 250k server resolves 96 sessions: 100 prompts of
+With base-state sizing, the uncapped fit at 250k is 96 sessions: 100 prompts of
 about 3,000 tokens (306,093 prompt tokens total) all completed with HTTP 200 in
 238.6 s, while the shared pool's high-water mark stayed at 1,675 of 1,954
-blocks instead of being oversubscribed.
+blocks instead of being oversubscribed. Current builds cap autoscaling at 64
+sessions.
 
 The batch width is a per-model capability. Qwen3.8 Flash-Next advertises
 batched plans from two to **256 rows**. Auto sessions fill the decode cohort up
-to the resolved session count, so the plan scales with the pool: 96 rows at
-250k, 150 at 128k, 256 at short context. Wide plans (>32 rows) use the
+to the resolved session count, which current builds cap at 64, so the plan
+scales with the pool up to 64 rows. Wide plans (>32 rows) use the
 compacted expert buckets for the routed Q4_K projection; narrow tails keep the
 grouped vector path, and the dense, attention and shared-expert work uses the
 full plan width. Its MTP drafting stays on the
@@ -1672,18 +1673,22 @@ level.
 
 Text inference no longer writes one INFO line per request. At INFO it emits a
 **10 s interval table** (`conc | pp/s req tg/s req TTFT ms | win pp/s win
-tg/s req/s win s fail cache`) and a **once-per-minute completed-request
+tg/s adm done win s fail cache`) and a **once-per-minute completed-request
 line** listing the request IDs with `ok`, `cancel` or `fail`. Every numeric
 table column is the difference between two consecutive snapshots: an idle row
 therefore reports zeros instead of the lifetime average. The `win` columns are
-the aggregate prompt and generated token throughput over that interval; `win s`
-is the interval duration; `fail` and `cache` count failures and prefix-cache
-hits in the interval. The table header is printed only after a minute request
-line, so the 10 s rows between minute boundaries carry data without repeating
-the header. Routine scheduler and cache detail stays at DEBUG: batch-limit
-changes, batched prefill widths, cache acquire/retention events and
-per-request receipt/completion lines. Errors still escalate to WARN/ERROR at
-every level.
+the aggregate prompt and generated token throughput over that interval;
+`adm` is the number of requests newly accepted by the scheduler, including
+requests that wait in the pending queue; `done` is the number of finished
+requests, including cancelled and failed ones; `win s` is the interval
+duration; `fail` and `cache` count failures and prefix-cache hits in the
+interval. `conc` remains the live count of requests currently being processed,
+so a row can have `conc > 0` while `done = 0` and `adm = 0` when admitted
+requests are still running. The table header is printed only after a minute request line, so the
+10 s rows between minute boundaries carry data without repeating the header.
+Routine scheduler and cache detail stays at DEBUG: batch-limit changes,
+batched prefill widths, cache acquire/retention events and per-request
+receipt/completion lines. Errors still escalate to WARN/ERROR at every level.
 
 Set verbosity with `--log-level <error|warn|info|debug>` (default `info`);
 `-v`/`--verbose` is shorthand for `--log-level=debug` and cannot combine with

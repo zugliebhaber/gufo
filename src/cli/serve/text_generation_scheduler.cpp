@@ -580,6 +580,7 @@ struct StatsSnapshot {
   std::chrono::steady_clock::time_point time{};
   std::uint64_t total_prompt_tokens{0};
   std::uint64_t total_generated_tokens{0};
+  std::uint64_t admitted{0};
   std::uint64_t completed{0};
   std::uint64_t cancelled{0};
   std::uint64_t failed{0};
@@ -1862,6 +1863,19 @@ struct TextGenerationScheduler::Impl {
     PublishTerminal(request);
   }
 
+  /// Counts one request accepted by Submit. This is the arrival count shown as
+  /// `adm`; actual session admission can happen later behind the queue.
+  void RecordAdmissionStats() noexcept {
+    if (!scheduler_policy.log_stats)
+      return;
+    try {
+      std::lock_guard<std::mutex> lock(stats_mutex);
+      ++stats_admitted;
+    } catch (...) {
+      // Periodic statistics must never fail a request.
+    }
+  }
+
   /// Records one finished request for the periodic vLLM-style summary. The
   /// scheduler calls this after its normal completion path, including
   /// cancellations and failures; statistics are best effort.
@@ -1962,6 +1976,7 @@ struct TextGenerationScheduler::Impl {
       current.time = std::chrono::steady_clock::now();
       current.total_prompt_tokens = detail::TotalPromptTokens().load();
       current.total_generated_tokens = detail::TotalGenTokens().load();
+      current.admitted = stats_admitted;
       current.completed = stats_completed;
       current.cancelled = stats_cancelled;
       current.failed = stats_failed;
@@ -1986,6 +2001,7 @@ struct TextGenerationScheduler::Impl {
         delta(current.prompt_tokens, previous.prompt_tokens);
     const auto generated_tokens =
         delta(current.generated_tokens, previous.generated_tokens);
+    const auto admitted = delta(current.admitted, previous.admitted);
     const auto completed = delta(current.completed, previous.completed);
     const auto cancelled = delta(current.cancelled, previous.cancelled);
     const auto failed = delta(current.failed, previous.failed);
@@ -2017,26 +2033,25 @@ struct TextGenerationScheduler::Impl {
                                         previous.total_generated_tokens)) /
                   interval
             : 0.0;
-    const double request_rate =
-        interval > 0.0 ? static_cast<double>(finished) / interval : 0.0;
     const auto concurrency = std::max<std::int64_t>(
         0, detail::RequestsProcessing().load(std::memory_order_relaxed));
     if (header) {
       Logger::Info(
           "stats",
-          "conc |  pp/s req  tg/s req  TTFT ms |  win pp/s  win tg/s   req/s  "
-          "win s  fail  cache");
+          "conc |  pp/s req  tg/s req  TTFT ms |  win pp/s  win tg/s    adm   "
+          "done  win s  fail  cache");
       Logger::Info("stats",
                    "-----------------------------------------------------------"
-                   "---------------------------");
+                   "-----------------------------------");
     }
     std::ostringstream out;
     out << std::fixed << std::setprecision(1) << std::setw(4) << concurrency
         << " | " << std::setw(9) << pp_request << std::setw(9) << tg_request
         << std::setw(9) << std::setprecision(0) << ttft << " | " << std::setw(9)
         << std::setprecision(1) << total_pp << std::setw(9) << total_tg
-        << std::setw(7) << std::setprecision(2) << request_rate << std::setw(7)
-        << interval << std::setw(5) << failed << std::setw(6) << cache_hits;
+        << std::setw(7) << admitted << std::setw(7) << finished << std::setw(7)
+        << std::setprecision(2) << interval << std::setw(5) << failed
+        << std::setw(6) << cache_hits;
     Logger::Info("stats", out.str());
   }
 
@@ -3587,6 +3602,7 @@ struct TextGenerationScheduler::Impl {
   // requests; stats_monitor snapshots once per 10 s and once per minute.
   mutable std::mutex stats_mutex;
   std::deque<CompletedStats> stats_window;
+  std::uint64_t stats_admitted{0};
   std::uint64_t stats_prompt_tokens{0};
   std::uint64_t stats_generated_tokens{0};
   std::uint64_t stats_completed{0};
@@ -3979,6 +3995,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
     }
     throw TextGenerationError(refusal_code, refusal_message);
   }
+  impl_->RecordAdmissionStats();
   impl_->queue_condition.notify_one();
   // Emitted after the notification, not between the enqueue and it: these
   // lines allocate, and a failure there would throw out of Submit for a

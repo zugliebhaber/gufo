@@ -342,9 +342,9 @@ decode but hurt per-request latency.
 the default cohort, whose stable-prefix chunk boundary passes the deterministic
 256/256 gate at cohort 8/16/32 (`GUFO_BATCHED_PREFILL=0` is a diagnostics kill
 switch). Decode plans are explicit widths; Flash-Next advertises 2..256 rows.
-Auto sessions fill the decode cohort up to the resolved session count, so the
-plan scales with the pool: 96 rows at 250k, 150 at 128k, 256 at short context.
-Wide decode plans (>32 rows) use the compacted expert buckets; narrow tails keep
+Auto sessions fill the decode cohort up to the resolved session count, now
+hard-capped at 64; fixed pools can use wider plans up to 256 rows. Wide decode
+plans (>32 rows) use the compacted expert buckets; narrow tails keep
 the grouped vector path. Width 32 remains the retained cold canonical control.
 
 **Consequences.** The canonical c32 table is the throughput reference; c24
@@ -458,10 +458,10 @@ disable device-row lending for prefix-cache checkpoints so completed requests
 cannot pin pool blocks.
 
 **Consequences.** A single-user server stays at one session; a burst expands to
-the memory-and-demand limit and contracts when idle. On this host Flash-Next
-resolves to 150 sessions at 128k and 96 at 250k, so the hybrid plan reaches
-150 or 96 rows instead of the former 32-row control. The effective count
-appears as `sessions=auto(N)` and `event=auto_sessions`. The trade-off is bounded latency: a request that exceeds
+the memory-and-demand limit and contracts when idle. On this host the uncapped
+Flash-Next fit is 150 sessions at 128k and 96 at 250k, but autoscaling is
+hard-capped at 64, so the hybrid plan reaches at most 64 rows. The effective
+count appears as `sessions=auto(N)` and `event=auto_sessions`. The trade-off is bounded latency: a request that exceeds
 the current free KV waits for residents to release blocks instead of returning
 an error. Queue-full admission (`--max-pending`) and non-KV errors still fail
 fast. Non-text modalities keep their own fixed queues.

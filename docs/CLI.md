@@ -293,8 +293,9 @@ These apply to every modality, before or after the subcommand:
   per decode pass (hybrid plan selected by the resident cohort), Qwen3.8 27B
   and DeepSeek V4 Flash eight. `auto` resolves the
   pool after model load from the measured per-session **base state**, not the
-  full context: at 250k Qwen3.8 Flash-Next resolves to 96 sessions on this
-  host, and 128k resolves to 150. It starts with one resident session, grows
+  full context: the uncapped fit is 96 sessions at 250k and 150 at 128k, but
+  autoscaling is hard-capped at 64 (the environment variable may only lower
+  it). It starts with one resident session, grows
   toward queued demand, and returns to one when idle. Admission charges each
   request's prompt plus requested output against the shared KV pool; a request
   that does not fit stays queued and retries. Requests blocked by VRAM are
@@ -327,9 +328,9 @@ These apply to every modality, before or after the subcommand:
   separate, opt-in `trace` file records content. Debug admission lines do name
   the client by the peer IP address of its connection. At INFO, text serving
   emits a 10 s interval table (every row is the delta since the previous row)
-  and a once-per-minute completed-request line;
-  per-request receipt/completion, scheduler batch/prefill and cache
-  acquire/retention lines are DEBUG. See
+  with `adm` for newly accepted and `done` for finished request counts, plus a
+  once-per-minute completed-request line; per-request receipt/completion,
+  scheduler batch/prefill and cache acquire/retention lines are DEBUG. See
   [server logs](SERVER.md#troubleshooting-logs).
 
 The text server also exposes Prometheus metrics at `GET /metrics` (alias

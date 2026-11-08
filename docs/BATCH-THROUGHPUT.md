@@ -89,7 +89,7 @@ automatic, and the cohort follows the prefilling queue depth.
 | 7 | Coalesce identical greedy requests | Duplicate requests prefill and decode separately | Up to 9.08× on exact duplicates | Low/medium: greedy only | Opt-in `GUFO_REQUEST_COALESCE=1`; measured |
 | 8 | 256-row hybrid decode plan | Decode weight read per row | +7.4 % at 1024×32, +10.8 % at 256×128, neutral at 16 output | Low | Adopted |
 | 9 | Cohort assembly before decode | Small decode waves | Unlocks `plan=batched-w256` | Low | Adopted for auto sessions |
-| 10 | Base-state auto sessions + shared-KV admission | Full-context session charge | 96/150/256 resident sessions at 250k/128k/4k | Low | Adopted |
+| 10 | Base-state auto sessions + shared-KV admission | Full-context session charge | Historical uncapped fit 96/150/256 at 250k/128k/4k; current auto hard cap 64 | Low | Adopted |
 | 11 | Cache `ResourceClaim` per scheduler turn | `SharedKvPool()` calls `ResourceClaim()`, which runs `hipMemGetInfo` and host-memory reads, several times per turn | No gain measured (422.8 vs 416.3 s) | Low: snapshot once per turn | Tested at 1024×16; reverted |
 | 12 | MTP drafting beyond eight rows | Decode tokens per pass | +10-20 % on decode-heavy runs (estimate) | High: acceptance and correctness | Aggregate flat with the 8-row gate |
 | 13 | Decode GEMM/attention kernel work | ~125 tok/s decode phase | +3-8 % total at 32 output | High | Needs roofline/ISA profile |
@@ -195,8 +195,9 @@ with TTFT 106 -> 25 s and decode rows 48 -> 256.
 Per-request decode speed falls (0.7 vs 4.4 tok/s at 1024x32) because 256
 streams share the GPU; aggregate TG, wall and TTFT improve. The cohort
 principle has a TG face: synchronize decode-ready requests and let the widest
-qualified plan fill. The production 250k auto server already sizes that
-assembly to its 96 sessions. The "decode-rate estimate" is the server's
+qualified plan fill. The historical 250k auto server sized that assembly to
+its 96 sessions; current builds hard-cap autoscaling at 64. The "decode-rate
+estimate" is the server's
 per-request `decode_tps` times `batch_width`, not a wall-clock decomposition.
 
 ## Decode tile ladder and the 8k+1 tail
@@ -283,10 +284,11 @@ new ceiling: it is three full 64-request waves, which return to the same
 per-wave throughput while the wall grows.
 
 The fix is not more client concurrency; it is a **wider or faster wave**:
-raise the resident pool/plan to the 96/150/256 auto points, use the wide-decode
-kernels (#28, #25, #51, #52), and overlap prefill with decode. The current
-instance logs `batch_width=96` and `sessions=auto(96)`, so its decode wave is
-wider than the 64-request wave in this table; re-running the same load on it
+raise the resident pool/plan (the historical auto fit reached 96/150/256;
+current auto builds hard-cap at 64), use the wide-decode kernels (#28, #25,
+#51, #52), and overlap prefill with decode. The historical instance logged
+`batch_width=96` and `sessions=auto(96)`, so its decode wave was wider than the
+64-request wave in this table; re-running the same load on it
 moves the decode knee to 96 requests (client concurrency 48 at two requests per
 slot). The per-wave ceiling remains, but a faster kernel raises the ceiling
 itself.

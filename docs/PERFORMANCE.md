@@ -270,8 +270,9 @@ Measure reuse separately:
   +0.43% to +0.91% (noise; no group forms).
 - **Long-context auto sessions:** run with `--sessions auto --context 250000`
   and the canonical unique-nonce prompts. The pool resolves from measured
-  **base state** capacity, not full context (96 sessions at 250k and 150 at
-  128k on this host), grows with queued demand, and admits each request only
+  **base state** capacity, not full context (the uncapped fit is 96 sessions
+  at 250k and 150 at 128k on this host, but autoscaling is hard-capped at 64),
+  grows with queued demand, and admits each request only
   when its prompt plus requested output fits the shared KV pool. Requests that
   do not fit wait and retry instead of failing. Report aggregate PP/TG plus
   queue and TTFT at the requested concurrency: above the decode knee extra

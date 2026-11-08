@@ -91,19 +91,23 @@ std::uint32_t DecodePlanLimit() {
   return limit;
 }
 
-/// Upper bound for the auto-sized session pool. The fit still uses the
-/// measured base state; this only caps the resolved count for deployments
-/// that want a smaller resident pool than the memory fit allows.
+/// Hard upper bound for the auto-sized session pool. The fit still uses the
+/// measured base state; this keeps autoscaling at or below the deployment's
+/// concurrency budget even when the host could fit more sessions.
+inline constexpr std::size_t kMaxAutoSessions = 64;
+
+/// Upper bound for the auto-sized session pool. `GUFO_AUTO_SESSIONS_MAX` may
+/// lower the 64-session ceiling, never raise it.
 std::size_t AutoSessionCeiling() {
   static const std::size_t ceiling = [] {
     const char* text = std::getenv("GUFO_AUTO_SESSIONS_MAX");
     if (text == nullptr || *text == '\0')
-      return std::size_t{256};
+      return kMaxAutoSessions;
     char* end = nullptr;
     const auto parsed = std::strtoul(text, &end, 10);
     if (end == text || *end != '\0' || parsed < 1)
-      return std::size_t{256};
-    return std::min<std::size_t>(parsed, 4096);
+      return kMaxAutoSessions;
+    return std::min<std::size_t>(parsed, kMaxAutoSessions);
   }();
   return ceiling;
 }

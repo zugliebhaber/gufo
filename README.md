@@ -276,7 +276,8 @@ tile instead of being re-read for a one-row tail.
 
 Flash-Next advertises batched plans from two to 256 rows
 (`kMaxBatchSessions`). Auto sessions fill the decode cohort up to the resolved
-session count: 96 rows at 250k, 150 at 128k, 256 at short context. Dense,
+session count, hard-capped at 64; fixed pools can advertise wider plans up to
+256 rows. Dense,
 attention and shared-expert work uses the full plan; wide plans use the
 compacted expert buckets, while narrow tails keep the grouped vector path.
 `GUFO_DECODE_MAX_ROWS` and `GUFO_ASSEMBLE_DECODE_ROWS` are A/B overrides.
@@ -291,12 +292,13 @@ decode rate for higher aggregate throughput.
 `--sessions auto` resolves the pool after the model is resident. It divides
 measured free state capacity by the per-session base state (block table,
 indexer and recurrent state, not the shared KV rows) and keeps a 25 % reserve
-for cache backing, transfer streams and allocator fragmentation. On this host
-Flash-Next resolves to **96 sessions at 250k** and **150 at 128k**; short
-contexts reach the 256 plan ceiling. The scheduler starts with **one resident
-session**, grows toward visible demand, and returns to one when idle. An
-admission that does not fit the shared pool stays queued and retries; it is
-not failed.
+for cache backing, transfer streams and allocator fragmentation. The uncapped
+base-state fit on this host is **96 sessions at 250k** and **150 at 128k**;
+autoscaling is hard-capped at **64 sessions**, and
+`GUFO_AUTO_SESSIONS_MAX` can only lower that ceiling. The scheduler starts with
+**one resident session**, grows toward visible demand, and returns to one when
+idle. An admission that does not fit the shared pool stays queued and retries;
+it is not failed.
 
 The 96 are the state-capacity result for a 250k context: per-session base state
 is ~304 MB (dominated by the ~217 MB indexer cache at 250k, plus 56.6 MB BF16
@@ -453,7 +455,8 @@ This is a completed benchmark run, not the live server log. The columns are:
 - `wall s` — wall time for the run,
 - `fail` — failed requests, `cache` — cache hits.
 
-The live server prints a 10 s interval table with `win pp/s` / `win tg/s` and
+The live server prints a 10 s interval table with `win pp/s` / `win tg/s`,
+`adm` (newly accepted requests) and `done` (finished requests) counts and
 `win s`; every row is the delta since the previous row, so idle rows report
 zero rather than the run average.
 
@@ -605,7 +608,7 @@ Settings that matter for the two design goals:
 | --- | --- | --- |
 | context per session | `--context N` | Long prompts or many sessions; Flash-Next above 262144 needs `--enable-yarn` |
 | resident sessions | `--sessions N\|auto` | `auto` fits the pool from base state; fixed values cap the resident count |
-| auto-session cap | `GUFO_AUTO_SESSIONS_MAX=N` | cap the resolved auto pool (default 256 or the memory fit); the current deployment uses 64 |
+| auto-session cap | `GUFO_AUTO_SESSIONS_MAX=N` | lower the hard 64-session autoscaling cap; the value may never raise it |
 | prefill work unit | `--prefill-chunk N` | Larger units amortise expert reads; the scheduler also shrinks to free KV |
 | RAM prefix cache | `--cache-ram-bytes N\|off` | Keep repeated/shared prefixes warm; `off` for cold benchmark runs |
 | cold retention | `--cache-retain-cold` | Opt unique single-turn prompts into retention |
@@ -632,7 +635,7 @@ Serving recipes:
 # Throughput: wide decode, cache off, 4k context
 gufo serve llm --model MODEL --context 4096 --sessions 256 --cache-ram-bytes off
 
-# Long context: auto sessions resolve to the state-capacity fit
+# Long context: auto sessions resolve to the state-capacity fit, capped at 64
 gufo serve llm --model MODEL --context 250000 --sessions auto
 
 # Single-user latency: one session, optional MTP drafts

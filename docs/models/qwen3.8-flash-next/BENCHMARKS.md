@@ -380,7 +380,8 @@ The same build resolves **150 sessions at 128k** (`base_state_bytes=210054164`,
 `state_capacity_bytes=42278993920`, `shared_kv_tokens=128000`). Both counts
 exceed the former 32-row control; the hybrid plan fills up to 96 or 150 rows
 and the scheduler serves any further sessions in later waves. `/v1/models`
-reports `context_length=250000`.
+reports `context_length=250000`. Current builds hard-cap autoscaling at 64;
+the 96/150 figures are retained historical measurements from uncapped builds.
 
 Two bounded loads used unique nonces (so every prompt is a cache miss) and
 non-streaming requests:
@@ -475,7 +476,8 @@ adds **5.8 % TG**. A decode-dominated run (256 requests x 128-token budget, ~12k
 Per-request decode speed falls (0.7 vs 4.4 tok/s at 1024x32) because 256
 streams share the GPU; aggregate TG, wall and TTFT improve. The trade is
 explicit: wide decode cohorts optimize aggregate TG, not per-stream latency.
-The production 250k auto server sizes its decode assembly to 96 sessions.
+The production 250k auto server in that build sized its decode assembly to 96
+sessions; current builds cap autoscaling at 64.
 
 ### Decode tile ladder (2026-11-06)
 

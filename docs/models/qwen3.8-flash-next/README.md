@@ -128,8 +128,8 @@ creating sessions.
 
 Decode runs in waves of the model's batch width. This model advertises batched
 plans from two to **256 rows** (`kMaxBatchSessions`). Auto sessions fill the
-decode cohort up to the resolved count, so the plan scales with the pool: 96
-rows at 250k, 150 at 128k, 256 at short context. Wide plans (>32 rows) use the
+decode cohort up to the resolved count, hard-capped at 64; fixed pools can use
+wider plans up to 256 rows. Wide plans (>32 rows) use the
 compacted expert buckets for the routed Q4_K projection; narrow tails keep the
 grouped vector path, and the dense, attention and shared-expert work uses the
 full plan width. MTP drafting keeps its eight-row gate, which means a wider
@@ -163,9 +163,9 @@ batched prefill are not yet restored by the component cache; the measurements
 use cache off. See
 [batch throughput levers](../../BATCH-THROUGHPUT.md#baseline-and-where-the-time-goes).
 
-With base-state auto sizing, `--sessions auto` resolves to 150 sessions at
-128k and 96 at 250k on this host, so the hybrid decode plan reaches 150 or 96
-rows instead of the former 32-row control.
+With base-state auto sizing, the uncapped fit is 150 sessions at 128k and 96
+at 250k on this host; the current hard cap makes the effective auto pool 64
+sessions, so the hybrid decode plan reaches at most 64 rows.
 Admission charges each request's prompt plus requested output against the
 shared pool, so short conversations share the pool while long ones wait. The
 retained 128k sweep saturates aggregate decode near 76 tok/s from 16 clients;

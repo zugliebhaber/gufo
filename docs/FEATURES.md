@@ -116,9 +116,10 @@ Evidence: `docs/BATCH-THROUGHPUT.md` ("Decode tile ladder"),
 
 Qwen3.8 Flash-Next advertises batched plans from two to 256 rows
 (`kMaxBatchSessions`; the checked-in baseline caps it at 32). The hybrid plan
-fills the widest cohort the resident sessions can supply: 96 rows on a 250k
-auto server, 150 at 128k, 256 at short context. Dense, attention and shared-expert work use the full
-plan; the routed Q4_K expert projection keeps its qualified chunking.
+fills the widest cohort the resident sessions can supply; autoscaling is
+hard-capped at 64, while fixed pools can use wider plans up to 256 rows.
+Dense, attention and shared-expert work use the full plan; the routed Q4_K
+expert projection keeps its qualified chunking.
 `GUFO_DECODE_MAX_ROWS` narrows the ceiling for A/B runs, and
 `GUFO_ASSEMBLE_DECODE_ROWS` controls how many ready decoders a wave waits for.
 
@@ -136,10 +137,10 @@ divides measured free state capacity by the per-session base state (block
 table, index and recurrent state, not the shared KV rows) and keeps a 25 %
 reserve. The scheduler starts with one resident session, grows toward visible
 demand, returns to one when idle, and defers KV-blocked requests instead of
-failing them. `GUFO_AUTO_SESSIONS_MAX=N` caps the resolved count below the
-memory fit (default 256); the current deployment uses 64. Fixed-session servers
-keep the old behavior; image, audio, embedding and video servers do not accept
-`auto`.
+failing them. Autoscaling is hard-capped at 64 sessions;
+`GUFO_AUTO_SESSIONS_MAX=N` may lower that ceiling but never raise it.
+Fixed-session servers keep the old behavior; image, audio, embedding and video
+servers do not accept `auto`.
 
 Purpose: do not force the operator to choose between latency and aggregate
 throughput before the workload is known.
@@ -456,14 +457,16 @@ endpoints.
   concurrency for a model. Purpose: find the batch knee without a bespoke
   harness. Evidence: the two scripts and `PROGRESS.md` `TP-P1`.
 - **Periodic text statistics.** Text serving logs a 10 s interval table
-  (`conc | pp/s req tg/s req TTFT | win pp/s win tg/s req/s win s fail cache`)
+  (`conc | pp/s req tg/s req TTFT | win pp/s win tg/s adm done win s fail cache`)
   and a once-per-minute completed-request line. Every row reports the
   difference from the previous snapshot, so idle rows show zero rather than
-  lifetime averages. The table header follows the minute line; per-request
-  receipt/completion, scheduler batch/prefill and cache acquire/retention
-  details move to DEBUG. Purpose: keep the log vLLM-like and correlate the
-  shared pool with interval throughput. Evidence: `text_generation_scheduler.cpp`
-  (`LogStats`, `LogCompletedWindow`), `docs/SERVER.md`.
+  lifetime averages. `conc` is the live count, `adm` counts newly accepted
+  requests and `done` counts finished requests in the interval. The table
+  header follows the minute line; per-request receipt/completion, scheduler
+  batch/prefill and cache acquire/retention details move to DEBUG. Purpose:
+  keep the log vLLM-like and correlate the shared pool with interval
+  throughput. Evidence: `text_generation_scheduler.cpp` (`LogStats`,
+  `LogCompletedWindow`), `docs/SERVER.md`.
 - **Prometheus metrics and Grafana dashboard.** `/metrics` (alias
   `/v1/metrics`) exposes request outcomes, TTFT and duration histograms, token
   and cache counters, session occupancy, KV pressure and process/host memory.
