@@ -90,10 +90,11 @@ AR/speculative model modes; full model runs stay outside hosted CI.
 ## Metrics and monitoring
 
 `http_server_test` covers the exposition without loading weights: HELP/TYPE
-families, request counters, both histograms, session/memory gauges and the
-`gufo_*` aliases. The functional metrics suite starts an isolated server and
-reconciles completed and cancelled work against the terminal logs, slots and
-KV ratio:
+families, request counters, both histograms, session/memory gauges, the
+`gufo_*` aliases and the KV pool/shared-block gauges
+(`gufo_kv_pool_shared_blocks`). The functional metrics suite starts an isolated
+server and reconciles completed and cancelled work against the terminal logs,
+slots and KV ratio:
 
 ```sh
 cmake --preset cpu-test
@@ -109,6 +110,12 @@ python3 tests/functional/run.py \
 The metrics suite's warm-retry assertion expects the first unique prompt to be
 retained; `--cache-retain-cold` supplies that precondition. Use the affected
 speculative mode instead of `off` when changing mode-specific counters.
+
+For live prefix sharing or KV eviction, also run `qwen_kv_blocks_test`
+(`ForkFrom`/tail COW), `cache_prefix_index_test`, `cache_retention_test` and
+`component_text_cache_test` beside `text_generation_scheduler_test`. During a
+shared-prefix burst, `gufo_kv_pool_shared_blocks` must be greater than zero and
+return to zero once the burst drains.
 
 For a live server, validate the exposition and dashboard references as shown
 in [Prometheus validation](PROMETHEUS.md#validation-and-troubleshooting) and

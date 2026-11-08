@@ -62,6 +62,8 @@ struct KvPoolGauges {
   std::uint32_t live_blocks{};
   std::uint32_t free_blocks{};
   std::uint32_t high_water_blocks{};
+  /// Live blocks shared by more than one request (prefix COW).
+  std::uint32_t shared_blocks{};
   std::uint64_t block_bytes{};
 };
 

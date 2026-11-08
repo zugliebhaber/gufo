@@ -6,17 +6,18 @@
 > page is the diagram-first view of how the shared device KV pool, the
 > per-session page tables and the host-side checkpoint cache fit together.
 
-The important distinction is that Gufo has **two layers of reuse**:
+On the Qwen component-cache path (Qwen3.8-27B and Flash-Next), Gufo has **two
+layers of reuse**:
 
 1. **Attention KV inside one request** — the full-attention K/V rows are written
    into a shared, paged device pool as the request prefills and decodes.
-2. **Checkpoints across requests** — an opaque model snapshot (including those
-   K/V rows and all private recurrent/indexer state) is retained and restored
-   for an exact prompt prefix.
+2. **Prefix reuse across requests** — a radix-style compressed token-prefix
+   tree indexes live frontiers and opaque model snapshots (including their K/V
+   rows and all private recurrent/indexer state) for exact prompt prefixes.
 
-Pagination belongs to layer 1. Prefix reuse belongs to layer 2. They meet at
-the point where a restored checkpoint adopts full KV blocks by reference
-instead of copying their rows.
+Pagination belongs to layer 1. Prefix reuse belongs to layer 2. They meet when
+a live frontier lends full KV blocks, or when Flash-Next restores a checkpoint
+that adopts full KV blocks by reference; Qwen3.8-27B copies rows on restore.
 
 ## 1. The two layers at a glance
 
@@ -48,11 +49,13 @@ flowchart TB
   LF --> PRIV
 ```
 
-- `PrefixIndex` selects a live frontier, a RAM checkpoint, or a durable
-  checkpoint. Selection is exact-prefix only.
+- `PrefixIndex` is a radix tree (compressed token-prefix tree) per
+  compatibility identity. It stores token edges and record pointers, not KV
+  rows, and selects a live frontier, a RAM checkpoint or a durable checkpoint.
+  Selection is exact-prefix only.
 - A live frontier is already in a session; reusing it takes no restore copy.
-- A checkpoint restore fills a free session and may adopt full KV blocks by
-  reference.
+- On Flash-Next, a checkpoint restore fills a free session and may adopt full
+  KV blocks by reference; Qwen3.8-27B copies rows on restore.
 - `KvBlockPool` owns block ids and reference counts. It never owns bytes; the
   model executor owns the single device allocation for both K/V planes.
 - `PRIV` is deliberately outside the paged pool. Flash-Next's 36 linear (GDN)
@@ -314,11 +317,11 @@ sequenceDiagram
 
 - `ForkFrom` requires an empty destination table. It retains every full block
   in the shared prefix and allocates a private block for the partial tail.
-- A restore of a checkpoint uses `Adopt`/`AdoptSharedRows` only for ranges that
-  are **128-token aligned**. The adapter validates every source block before
-  adopting any; a failed validation leaves the destination table untouched and
-  falls back to a row copy.
-- A **live frontier** can lend its device rows directly. The restore receives
+- On Flash-Next, a restore of a checkpoint uses `Adopt`/`AdoptSharedRows` only
+  for ranges that are **128-token aligned**. The adapter validates every source
+  block before adopting any; a failed validation leaves the destination table
+  untouched and falls back to a row copy. Qwen3.8-27B always copies rows.
+- On Flash-Next, a **live frontier** can lend its device rows directly. The restore receives
   the source's own device pointer and generation; a pointer/generation mismatch
   means the rows changed and the restore copies instead.
 - Before a slot is invalidated or reset, `ReleaseAll` drops the session's table
@@ -473,9 +476,23 @@ actual pool:      live_blocks * block_bytes <= pool capacity
 The first bound protects the execution states and leaves the 25 % reserve for
 cache backing, transfer streams and allocator fragmentation; the second bound
 controls in-flight KV. They are intentionally separate: a session owns its
-block table and index, not the KV rows it maps later.
+block table and index, not the KV rows it maps later. Per-request admission
+reserves the complete private prompt plus a bounded output horizon (4096
+tokens for an explicit `max_tokens`, 512 for unlimited), not the full client
+budget. A live shared prefix is charged once; only each follower's private
+tail is added. The resident sum is compared with the pool capacity, not its
+free counter: the executor can map the whole prompt while the logical prefill
+position sits at a checkpoint, and a cache restore can materialize rows after
+admission. Actual
+block mapping still enforces the hard pool limit and KV exhaustion keeps excess
+requests replayable. On Flash-Next, live prefix sharing borrows a leader's full
+blocks and adopts them by refcount; only the partial tail block is copied, and
+`gufo_kv_pool_shared_blocks` reports the shared blocks. Completed frontiers fall
+back to host snapshots when the pool cannot cover the configured decode
+cohort's full contexts (up to eight), so a small device pool is never pinned
+by finished requests.
 
-### Worked example: uncapped 96-session fit at 250k
+### Worked example: uncapped 96-session fit versus the current profile
 
 | quantity | value |
 | --- | ---: |
@@ -488,11 +505,21 @@ block table and index, not the KV rows it maps later.
 | measured state capacity | about 36.6 GiB |
 | uncapped auto fit after 25 % reserve | 96 |
 | effective auto sessions (hard cap) | 64 |
+| current operator pool | 17 GiB = 5,802 blocks / 742,656 tokens |
+| current operator session cap | 40 |
+| current host headroom after load | about 8 GB |
+| current long-request fit (26k prompt + 4k horizon) | about 24 |
 
 The pool holds about **one full 250k context**, not 96. The uncapped fit is 96
 sessions, but current builds hard-cap autoscaling at 64; each session is
 admitted because it owns only about 290 MiB of base state, and KV blocks map
-lazily from the shared pool as prompts and outputs grow. Medium-length chats
+lazily from the shared pool as prompts and outputs grow.
+
+The current deployment lowers the cap to 40 with a 17 GiB pool (742,656
+tokens), a 2 GiB cache and about 8 GB host headroom. Short requests fill all
+40 sessions; a 26k prompt plus the 4k output horizon costs ~30k tokens, so the
+pool admits about 24 long requests. The 96/150 numbers above remain the
+uncapped historical fit. Medium-length chats
 share the pool comfortably. If the pool does fill, admission holds new
 requests and KV exhaustion defers a resident request instead of allocating
 beyond the budget.

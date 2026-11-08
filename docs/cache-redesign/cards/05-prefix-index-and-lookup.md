@@ -1,7 +1,8 @@
 # 05 · Prefix index and lookup
 
 **Milestone:** Common package · **Depends on:** 04 · **Size:** M ·
-**Affects:** nothing at runtime · **Status:** done
+**Affects:** common cache package; serving lookup through the component cache ·
+**Status:** done
 
 ## Goal
 
@@ -52,7 +53,9 @@ memory per checkpoint.
 
 [`src/cache/prefix_index.hpp`](../../../src/cache/prefix_index.hpp) and
 [`prefix_index.cpp`](../../../src/cache/prefix_index.cpp) add the common
-package's compressed token-prefix tree, partitioned by compatibility identity.
+package's compressed token-prefix tree (radix tree), partitioned by
+compatibility identity. Nodes carry token edges and record pointers, not KV
+rows.
 Each identity registers the adapter's required component inventory. Immutable
 checkpoint handles and live slot/generation descriptions share the tree;
 lookup returns every eligible resident candidate, logical transfer bytes,

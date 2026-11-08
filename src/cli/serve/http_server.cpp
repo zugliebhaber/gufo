@@ -1550,8 +1550,18 @@ HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
   return Ok(resp);
 }
 
-/// Context held by in-flight requests across all sessions.
+/// Shared paged-KV pool usage, the same value the `ctx%` log column and
+/// `gufo_kv_pool_used_ratio` report. Falls back to the session-context
+/// estimate only when the runner exposes no shared pool.
 double KvCacheUsageRatio(const TextGenerationBackend& b) {
+  const auto pool_capacity =
+      detail::KvPoolCapacityTokens().load(std::memory_order_relaxed);
+  if (pool_capacity > 0) {
+    const auto pool_free =
+        detail::KvPoolFreeTokens().load(std::memory_order_relaxed);
+    const auto used = pool_capacity > pool_free ? pool_capacity - pool_free : 0;
+    return static_cast<double>(used) / static_cast<double>(pool_capacity);
+  }
   const auto sessions = b.session_states();
   const std::size_t capacity = sessions.size() * b.max_context();
   if (capacity == 0) {
@@ -1718,8 +1728,8 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
       << "# TYPE llamacpp:kv_deferred_total counter\n"
       << "llamacpp:kv_deferred_total "
       << detail::TotalKvDeferrals().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:kv_cache_usage_ratio In-flight prompt and generated "
-         "tokens over sessions times context; excludes retained cache\n"
+      << "# HELP llamacpp:kv_cache_usage_ratio Shared paged-KV pool used "
+         "tokens over capacity; matches ctx% and gufo_kv_pool_used_ratio\n"
       << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
       << "llamacpp:kv_cache_usage_ratio " << KvCacheUsageRatio(b) << "\n";
 
@@ -1800,8 +1810,8 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
           "refused blocks",
           detail::TotalKvDeferrals().load(std::memory_order_relaxed));
   gauge("gufo_kv_cache_usage_ratio",
-        "In-flight prompt and generated tokens over sessions times context; "
-        "excludes retained cache",
+        "Shared paged-KV pool used tokens over capacity; matches ctx% and "
+        "gufo_kv_pool_used_ratio",
         KvCacheUsageRatio(b));
 
   const auto kv_pool_capacity =
@@ -1822,6 +1832,9 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
         kv_pool_used);
   gauge("gufo_kv_pool_block_tokens", "Tokens per shared KV block",
         detail::KvPoolBlockTokens().load(std::memory_order_relaxed));
+  gauge("gufo_kv_pool_shared_blocks",
+        "Live prefix blocks referenced by more than one request table",
+        detail::KvPoolSharedBlocks().load(std::memory_order_relaxed));
   gauge("gufo_kv_pool_used_ratio", "Used shared KV-pool tokens over capacity",
         kv_pool_used_ratio);
   gauge("gufo_kv_pool_used_percent",
@@ -1859,6 +1872,20 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
         detail::LastStatsFailed().load(std::memory_order_relaxed));
   gauge("gufo_stats_cache_hits", "Latest interval prefix-cache hit count",
         detail::LastStatsCacheHits().load(std::memory_order_relaxed));
+  const auto requests_deferred = std::max<std::int64_t>(
+      0, detail::RequestsDeferred().load(std::memory_order_relaxed));
+  const auto requests_waiting = std::max<std::int64_t>(
+      0, detail::RequestsWaiting().load(std::memory_order_relaxed));
+  gauge("gufo_stats_queue", "Latest interval total queue depth",
+        detail::LastStatsQueue().load(std::memory_order_relaxed));
+  gauge("gufo_requests_waiting",
+        "Requests parked for shared-prefix, KV retry or preemption replay",
+        requests_waiting);
+  gauge("gufo_requests_queued", "Total requests waiting outside processing",
+        requests_deferred + requests_waiting);
+  gauge("gufo_stats_queue_max",
+        "Maximum queue depth in the latest completed minute",
+        detail::LastStatsQueueMax().load(std::memory_order_relaxed));
 
   const auto completed =
       detail::TotalRequestsCompleted().load(std::memory_order_relaxed);

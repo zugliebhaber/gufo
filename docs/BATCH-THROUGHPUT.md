@@ -89,7 +89,7 @@ automatic, and the cohort follows the prefilling queue depth.
 | 7 | Coalesce identical greedy requests | Duplicate requests prefill and decode separately | Up to 9.08× on exact duplicates | Low/medium: greedy only | Opt-in `GUFO_REQUEST_COALESCE=1`; measured |
 | 8 | 256-row hybrid decode plan | Decode weight read per row | +7.4 % at 1024×32, +10.8 % at 256×128, neutral at 16 output | Low | Adopted |
 | 9 | Cohort assembly before decode | Small decode waves | Unlocks `plan=batched-w256` | Low | Adopted for auto sessions |
-| 10 | Base-state auto sessions + shared-KV admission | Full-context session charge | Historical uncapped fit 96/150/256 at 250k/128k/4k; current auto hard cap 64 | Low | Adopted |
+| 10 | Base-state auto sessions + shared-KV admission | Full-context session charge | Historical uncapped fit 96/150/256 at 250k/128k/4k; current auto hard cap 64; this deployment 40 with a 17 GiB pool | Low | Adopted |
 | 11 | Cache `ResourceClaim` per scheduler turn | `SharedKvPool()` calls `ResourceClaim()`, which runs `hipMemGetInfo` and host-memory reads, several times per turn | No gain measured (422.8 vs 416.3 s) | Low: snapshot once per turn | Tested at 1024×16; reverted |
 | 12 | MTP drafting beyond eight rows | Decode tokens per pass | +10-20 % on decode-heavy runs (estimate) | High: acceptance and correctness | Aggregate flat with the 8-row gate |
 | 13 | Decode GEMM/attention kernel work | ~125 tok/s decode phase | +3-8 % total at 32 output | High | Needs roofline/ISA profile |
@@ -134,8 +134,8 @@ The list below is ranked within the new block by expected **total** TG at
 | 33 | Draft-vocabulary subset head | Full 248k-vocab head per row in decode | +1-4 % decode | Medium: draft-vocab exactness | Partial: draft subset exists for MTP |
 | 34 | KV block-size tuning | 256-token blocks add fragmentation and read slack at short contexts | +1-3 % | Low/medium: pool layout, migration | **Tested/rejected (2026-11-07):** 128 vs 256-token blocks over a 2x2 A/B at 1024x16: 128 gives 206.78/206.75 s and 79.2/79.2 TG, 256 gives 206.22/206.86 s and 79.5/79.2 TG. Difference is run noise; block stays 128 |
 | 35 | KV block defragmentation/contiguous active blocks | Scattered blocks slow paged attention | +0.5-2 % | Medium: pool compaction | Proposal |
-| 36 | Runtime shared-prefix block dedup | Duplicate prefix blocks across concurrent requests | 2-5x on shared-prefix workloads; neutral unique | Medium: block sharing, COW | Partial: KV blocks share by reference; batched prefill still recomputes |
-| 37 | Prefix-aware admission/grouping | Cohorts mix prefixes and miss shared-prefix reuse | +1-3 % shared-prefix | Low/medium: scheduler affinity | Partial: shared-prefix leader exists; no cohort affinity |
+| 36 | Runtime shared-prefix block dedup | Duplicate prefix blocks across concurrent requests | 2-5x on shared-prefix workloads; neutral unique | Medium: block sharing, COW | **Implemented for live Flash-Next prefixes:** full blocks adopt by refcount, only private tails copy; completed frontiers host-swap on one-context pools; 27B copies rows on restore |
+| 37 | Prefix-aware admission/grouping | Cohorts mix prefixes and miss shared-prefix reuse | +1-3 % shared-prefix | Low/medium: scheduler affinity | Partial: live shared-prefix admission charges the prefix once; no cohort affinity |
 | 38 | Adaptive prefill chunk budget | Fixed chunk competes with active decode | +1-3 % total | Low: budget policy | Partial: budget adapts to KV/decoders |
 | 39 | Output-length-aware batch packing | A long request tails a cohort of short ones | +2-5 % tail | Medium: fairness/latency policy | Proposal |
 | 40 | Scheduler-side decode-plan/batch-buffer reuse | Plan object, request vector and lease metadata rebuilt every token | +0.5-1 % CPU | Low: scheduler bookkeeping; no KV/page/pool change | Proposal |
@@ -196,7 +196,8 @@ Per-request decode speed falls (0.7 vs 4.4 tok/s at 1024x32) because 256
 streams share the GPU; aggregate TG, wall and TTFT improve. The cohort
 principle has a TG face: synchronize decode-ready requests and let the widest
 qualified plan fill. The historical 250k auto server sized that assembly to
-its 96 sessions; current builds hard-cap autoscaling at 64. The "decode-rate
+its 96 sessions; current builds hard-cap autoscaling at 64, and this deployment
+uses 40 with a 17 GiB pool. The "decode-rate
 estimate" is the server's
 per-request `decode_tps` times `batch_width`, not a wall-clock decomposition.
 
@@ -285,7 +286,8 @@ per-wave throughput while the wall grows.
 
 The fix is not more client concurrency; it is a **wider or faster wave**:
 raise the resident pool/plan (the historical auto fit reached 96/150/256;
-current auto builds hard-cap at 64), use the wide-decode kernels (#28, #25,
+current auto builds hard-cap at 64, and this deployment uses 40 with a 17 GiB
+pool), use the wide-decode kernels (#28, #25,
 #51, #52), and overlap prefill with decode. The historical instance logged
 `batch_width=96` and `sessions=auto(96)`, so its decode wave was wider than the
 64-request wave in this table; re-running the same load on it

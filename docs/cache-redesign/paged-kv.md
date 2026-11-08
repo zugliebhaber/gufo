@@ -8,8 +8,10 @@ session maps its whole context, the same memory envelope as the contiguous
 planes it replaces). The paged *snapshot restore* divergence from §10 is fixed:
 the cache and the snapshot walker resolve rows through the block table's
 physical ids, and blocks are zeroed before a session can preserve rows.
-Requests now share physical KV blocks: a capture lends full-attention blocks and
-a restore adopts them with one pool reference (§10). Draft for review, 2026-10-30.
+On Flash-Next, requests now share physical KV blocks: a capture lends
+full-attention blocks and a restore can adopt them with one pool reference
+(§10). Qwen3.8-27B uses the same paged pool but copies attention rows on
+restore. Draft for review, 2026-10-30; model split updated 2026-11-08.
 Scope: Qwen3.8-27B and Qwen3.8-Flash-Next text serving on gfx1151.
 Related: [cache redesign RFC](RFC.md) (its
 [open question](RFC.md#open-questions) *whether measured live-memory/cross-slot
@@ -250,7 +252,8 @@ Snapshots keep their current shape: opaque payload, model-owned
 changes from inline rows to a block reference list:
 
 - capture writes `{block count, block ids}` plus the private region;
-- restore adopts the ids and bumps refcounts instead of copying rows;
+- on Flash-Next, restore adopts the ids and bumps refcounts instead of copying
+  rows; Qwen3.8-27B copies rows into the destination table;
 - a restored session that continues writing past the captured length copies
   only the partial tail block;
 - disk persistence still serialises rows (blocks are device-local), so the

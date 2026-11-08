@@ -258,11 +258,14 @@ kernel work, but it cannot show cache or coalescing gains.
 
 Measure reuse separately:
 
-- **Shared-prefix cache:** run with `--shared-prefix` and the RAM cache at
-  auto; report output tok/s, TTFT and wall time. Cached prefill is logged as
-  `prefill_tokens=0`, so a physical-token sum can decrease while the user-facing
-  rate improves. A c32 shared-prefix run measured 94.67 -> 119.94 output tok/s
-  (+26.7%) and 13.87 -> 0.223 s TTFT.
+- **Shared-prefix cache:** run with `--cache-ram-bytes` at auto (the default),
+  not `off`; report output tok/s, TTFT and wall time.
+  Cached prefill is logged as `prefill_tokens=0`, so a physical-token sum can
+  decrease while the user-facing rate improves. On Flash-Next, live followers
+  adopt full prefix blocks by refcount (`gufo_kv_pool_shared_blocks`); only the
+  partial tail is copied, while Qwen3.8-27B copies rows on restore. A c32
+  shared-prefix run measured 94.67 -> 119.94 output
+  tok/s (+26.7%) and 13.87 -> 0.223 s TTFT.
 - **Request coalescing:** run `GUFO_REQUEST_COALESCE=1` on byte-identical
   greedy requests; followers have no KV and log `prefill_tokens=0`. A
   32-identical batch measured 44.410 -> 4.891 s (9.08x) and 4096 identical
@@ -271,10 +274,12 @@ Measure reuse separately:
 - **Long-context auto sessions:** run with `--sessions auto --context 250000`
   and the canonical unique-nonce prompts. The pool resolves from measured
   **base state** capacity, not full context (the uncapped fit is 96 sessions
-  at 250k and 150 at 128k on this host, but autoscaling is hard-capped at 64),
-  grows with queued demand, and admits each request only
-  when its prompt plus requested output fits the shared KV pool. Requests that
-  do not fit wait and retry instead of failing. Report aggregate PP/TG plus
+  at 250k and 150 at 128k on this host, but autoscaling is hard-capped at 64;
+  the current operator profile lowers it to 40 with a 17 GiB pool and 2 GiB
+  cache), grows with queued demand, and admits each request only when its complete
+  private prompt plus a bounded 4k output horizon fits the shared KV pool. A
+  live shared prefix is charged once; followers reserve only their tail.
+  Requests that do not fit wait and retry instead of failing. Report aggregate PP/TG plus
   queue and TTFT at the requested concurrency: above the decode knee extra
   clients only queue. The retained 128k sweep, the new 250k run and the MTP A/B
   are in [the Flash-Next

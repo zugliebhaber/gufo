@@ -725,6 +725,8 @@ struct TextRunnerPool::Impl {
           validated.runner, state_count, std::min(requested, ceiling),
           disk_cache_options, !ram_cache_options.capacity_bytes, ceiling,
           ram_cache_options.enabled, ram_cache_options.retain_cold);
+      prefix_cache_enabled =
+          ram_cache_options.enabled && std::min(requested, ceiling) != 0;
       if (disk_cache_options) {
         shared_prefix_min_tokens = disk_cache_options->shared_prefix_min_tokens;
         shared_prefix_max_boundaries =
@@ -743,6 +745,8 @@ struct TextRunnerPool::Impl {
         },
         MakeSnapshotSupport(&validated, ram_cache_options),
         TextRunnerRamCacheOptions::kMaxEntries);
+    prefix_cache_enabled =
+        ram_cache_options.enabled && cache->snapshot_capacity_bytes() > 0;
     // Entry and byte limits constrain retention independently of session count.
     if (validated.descriptor.capabilities.snapshot) {
       // Report the same post-allocation limits that selected the capacity.
@@ -788,6 +792,8 @@ struct TextRunnerPool::Impl {
   ValidatedRunner validated;
   std::unique_ptr<ContinuationCache> cache;
   std::unique_ptr<ComponentTextCache> component_cache;
+  /// True when a retained prefix exists for cross-request sharing.
+  bool prefix_cache_enabled{false};
   // Publish a live checkpoint before another admission can fall back to the
   // older prompt snapshot. Decode/prefill work never holds this mutex.
   std::timed_mutex admission_mutex;
@@ -2450,6 +2456,10 @@ std::optional<TextPendingPublication> TextRunnerPool::PendingPublication(
   return impl_->component_cache ? impl_->component_cache->PendingPublication(
                                       prompt, context, checkpoint_id)
                                 : std::nullopt;
+}
+
+bool TextRunnerPool::PrefixCacheEnabled() const noexcept {
+  return impl_->prefix_cache_enabled;
 }
 
 std::size_t TextRunnerPool::CachedPrefixTokens(

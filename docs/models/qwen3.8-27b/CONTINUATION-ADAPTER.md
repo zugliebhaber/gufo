@@ -3,7 +3,10 @@
 The adapter owns each target `hip::QwenGpuExecutor` and, in DFlash2 mode, its
 draft backend. `QwenTextRunnerState` binds those component-cache slots and its
 verifier borrows the slot's draft backend. AR and DFlash2 HTTP serving use this
-path. The adapter adds no alternative model evaluator.
+path. The adapter adds no alternative model evaluator. Prefix lookup runs
+through the component cache's radix-style compressed token-prefix tree; a
+checkpoint restore copies attention rows into the destination rather than
+adopting a live leader's full KV blocks.
 
 Each checkpoint contains the exact stable target frontier:
 

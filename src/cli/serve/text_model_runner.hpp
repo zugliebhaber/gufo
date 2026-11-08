@@ -193,6 +193,8 @@ struct TextRunnerResourceClaim {
   std::optional<std::size_t> shared_kv_capacity_tokens;
   std::optional<std::size_t> shared_kv_free_tokens;
   std::optional<std::size_t> shared_kv_block_tokens;
+  /// Live blocks referenced by more than one request table.
+  std::optional<std::size_t> shared_kv_shared_blocks;
   bool requires_device_runtime_lock{false};
 };
 
@@ -735,6 +737,11 @@ public:
       std::optional<sampling::SamplerState> resume_sampler = std::nullopt);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
+  /// True when this pool can retain prefixes and share checkpoints between
+  /// requests. `--cache-ram-bytes off` keeps only a request's own live state;
+  /// planning a shared checkpoint then pins device KV without a retention
+  /// budget, so cross-request waiting must stay off.
+  [[nodiscard]] bool PrefixCacheEnabled() const noexcept;
   /// Longest RAM-retained prefix of prompt that Acquire could reuse, without
   /// leasing a state. An upper bound: Acquire may still prefer a shorter one.
   [[nodiscard]] std::size_t CachedPrefixTokens(

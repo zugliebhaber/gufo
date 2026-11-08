@@ -3,8 +3,10 @@
 Status: draft for review. Revised 2026-10-09 after the first review. Card 01's
 functional coverage is combined into one PR. Cards 02–13's common contracts,
 fake adapter, ledger, checkpoints, prefix lookup, slot protection, retention,
-backing, idle spill, disk store and tiered lookup are implemented; the cache
-redesign is not wired in.
+backing, idle spill, disk store and tiered lookup are implemented.
+Qwen3.8-Flash-Next and Qwen3.8-27B text serving now uses the component cache
+and its radix-style prefix index; card 19 still tracks the remaining all-model
+cutover and legacy-cache deletion.
 
 These cards split the [RFC implementation plan](../RFC.md#implementation-plan)
 into isolated steps. Each PR card is meant to become one pull request, or a
@@ -69,8 +71,9 @@ Changed lines, excluding generated files: **S** ≤ 300 · **M** 300–1,000 ·
 | [21](21-edit-boundary-admission.md) | Edit-boundary admission under byte pressure | Switch-over review | 07, 19 | S | in progress |
 | [22](22-small-budget-retention.md) | Retention under small RAM budgets | Switch-over review | 07, 19, 21 | M | in progress |
 
-Cards 02–19 change no runtime behavior until card 19 wires them in and deletes
-the legacy cache (D1).
+Cards 02–13 define the common package. Qwen3.8-Flash-Next and Qwen3.8-27B
+serving already use the component cache; card 19 tracks the remaining all-model
+cutover and legacy-cache deletion (D1).
 
 ## Dependency graph
 

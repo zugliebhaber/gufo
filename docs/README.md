@@ -3,6 +3,34 @@
 Start with the [top-level README quickstart](../README.md#quickstart). This
 page is the map of the detailed documentation.
 
+## Current deployment profile (2026-11-08)
+
+The operational profile on this 128 GiB Strix Halo is a long-prompt tuning of
+the product defaults:
+
+```text
+GUFO_AUTO_SESSIONS_MAX=40
+--sessions auto --context 250000
+--kv-pool-bytes 18253611008    # 17 GiB, 742,656 tokens
+--cache-ram-bytes 2147483648   # 2 GiB
+```
+
+The 40 preallocated session states cost `40 x 303.75 MB ~= 12.2 GB`; the
+17 GiB pool plus the 2 GiB cache leave about **8 GB host memory** available.
+The product hard cap remains 64 sessions, and `GUFO_AUTO_SESSIONS_MAX` can only
+lower it. With this profile:
+
+- short requests can fill all **40** sessions (`43` short requests run 40
+  active and 3 waiting);
+- a **26k prompt + 4k output horizon** costs ~30k tokens, so the 17 GiB pool
+  admits about **24** long requests (`43` long requests run 24 active and 19
+  waiting).
+
+The historical benchmark and cache-redesign documents retain the values
+measured with their then-current builds (including the uncapped 96/150 session
+fits and the 64-session hard cap examples). This section is the current
+operator profile; the product contract stays at the 64-session cap.
+
 ## Reading paths
 
 | I want to… | Read |

@@ -164,11 +164,24 @@ use cache off. See
 [batch throughput levers](../../BATCH-THROUGHPUT.md#baseline-and-where-the-time-goes).
 
 With base-state auto sizing, the uncapped fit is 150 sessions at 128k and 96
-at 250k on this host; the current hard cap makes the effective auto pool 64
-sessions, so the hybrid decode plan reaches at most 64 rows.
-Admission charges each request's prompt plus requested output against the
-shared pool, so short conversations share the pool while long ones wait. The
-retained 128k sweep saturates aggregate decode near 76 tok/s from 16 clients;
+at 250k on this host; the product hard cap makes the default auto pool 64
+sessions, so the hybrid decode plan reaches at most 64 rows. This deployment
+lowers the cap to 40 and therefore uses plans of at most 40 rows.
+
+**Current operator profile (2026-11-08).** This deployment lowers the cap with
+`GUFO_AUTO_SESSIONS_MAX=40`, runs a 17 GiB KV pool (742,656 tokens) and a 2 GiB
+RAM cache, and leaves about 8 GB host memory. The 40 states cost
+`40 x 303.75 MB ~= 12.2 GB`. Short requests fill 40 sessions; 43 short requests
+run 40 active and 3 waiting. A 26k prompt plus the 4k output horizon costs
+~30k tokens, so the 17 GiB pool admits about 24 long requests; 43 long requests
+run 24 active and 19 waiting.
+Admission charges each request's complete private prompt plus a bounded output
+horizon (4096 tokens for an explicit `max_tokens`, 512 for unlimited) against
+the shared pool capacity, not its lagging free counter. A live shared prefix is
+charged once: followers reserve only their private tail and output. Full prefix
+blocks are adopted by refcount; `gufo_kv_pool_shared_blocks` exposes the live
+sharing. The retained 128k sweep saturates aggregate decode near 76 tok/s from
+16 clients;
 MTP raises single-stream decode from 28.8 to 47.9 tok/s without moving the
 aggregate. See [auto sessions at
 250k](BENCHMARKS.md#auto-sessions-at-250k-2026-11-06) for the current run and
@@ -185,7 +198,11 @@ decode rows. Two separate workloads exercise reuse:
   `--cache-disk` for restart-safe continuation). A shared-prefix c32 run
   measured 94.67 -> 119.94 output tok/s (+26.7%) and 13.87 -> 0.223 s TTFT
   when the cache was enabled; the physical-token sum falls because cached
-  prefill is logged as zero. Report output and TTFT for this workload.
+  prefill is logged as zero. Lookup uses the component cache's radix-style
+  compressed token-prefix tree; live followers also adopt the leader's full
+  prefix blocks by refcount, and only the partial tail is copied.
+  `gufo_kv_pool_shared_blocks` reports the shared blocks. Report output and
+  TTFT for this workload.
 - **Request coalescing:** `GUFO_REQUEST_COALESCE=1` shares one greedy stream
   between byte-identical requests. A 32-identical batch measured 44.410 ->
   4.891 s (9.08x; an earlier 264-token prompt gave 9.53x), 4096 identical

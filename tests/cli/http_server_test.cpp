@@ -597,6 +597,7 @@ void TestPrometheusMetrics() {
         "gufo_kv_pool_free_tokens",
         "gufo_kv_pool_used_tokens",
         "gufo_kv_pool_block_tokens",
+        "gufo_kv_pool_shared_blocks",
         "gufo_kv_pool_used_ratio",
         "gufo_kv_pool_used_percent",
         "gufo_stats_concurrency",
@@ -607,9 +608,13 @@ void TestPrometheusMetrics() {
         "gufo_stats_generated_tokens_per_second",
         "gufo_stats_admitted",
         "gufo_stats_done",
+        "gufo_stats_queue",
         "gufo_stats_interval_seconds",
         "gufo_stats_failed",
-        "gufo_stats_cache_hits"}) {
+        "gufo_stats_cache_hits",
+        "gufo_requests_waiting",
+        "gufo_requests_queued",
+        "gufo_stats_queue_max"}) {
     assert(response.find("# TYPE " + gauge + " gauge\n") != std::string::npos);
   }
   assert(response.find("gufo_sessions_capacity 2\n") != std::string::npos);

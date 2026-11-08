@@ -39,6 +39,8 @@ struct KvPoolSnapshot {
   std::uint32_t live_blocks{};
   std::uint32_t free_blocks{};
   std::uint32_t high_water_blocks{};
+  /// Live blocks referenced by more than one table (prefix sharing / COW).
+  std::uint32_t shared_blocks{};
 };
 
 /// Reference-counted pool of attention KV blocks.
@@ -66,8 +68,19 @@ public:
   [[nodiscard]] std::uint32_t high_water_blocks() const noexcept {
     return high_water_;
   }
+  /// Blocks a second table references. These are the prefix rows SGLang-style
+  /// RadixAttention shares instead of copying.
+  [[nodiscard]] std::uint32_t shared_blocks() const noexcept {
+    std::uint32_t count = 0;
+    for (const auto references : references_) {
+      if (references > 1)
+        ++count;
+    }
+    return count;
+  }
   [[nodiscard]] KvPoolSnapshot Snapshot() const noexcept {
-    return {capacity_, live_blocks(), free_blocks(), high_water_};
+    return {capacity_, live_blocks(), free_blocks(), high_water_,
+            shared_blocks()};
   }
 
   /// Returns a fresh block with reference count 1, or `kInvalidKvBlock` when

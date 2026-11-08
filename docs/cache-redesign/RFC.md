@@ -940,6 +940,12 @@ about their measured performance on Gufo.
 
 ### Comparison table
 
+**Scope note (2026-11-08).** The `Current` column records the pre-redesign
+baseline at the time of this RFC. Qwen3.8-Flash-Next and Qwen3.8-27B text
+serving now uses the component cache and its radix-style prefix index; Flash-Next
+also shares live full KV blocks by refcount, while 27B copies rows on restore. The
+table below remains a historical design assessment.
+
 The columns describe architectural adaptations to Gufo, not a benchmark ranking
 of upstream products. Green means a good architectural fit for the row; yellow
 means conditional support, additional work or a tradeoff; red means the scoped

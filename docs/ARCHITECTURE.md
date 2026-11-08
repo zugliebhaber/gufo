@@ -212,6 +212,11 @@ flowchart TB
 The block-level implementation is diagrammed in the [visual KV cache and
 pagination guide](KV-CACHE-VISUAL.md).
 
+On the component-cache path used by Qwen3.8-27B and Flash-Next, prefix lookup
+uses a radix-style compressed token-prefix tree per compatibility identity. It
+indexes live frontiers and checkpoints; the KV rows themselves stay in the
+paged block pool.
+
 The design separates three reuse tiers:
 
 1. **Live session state** — a resident session keeps its KV/recurrent state;
@@ -290,8 +295,8 @@ flowchart LR
 
 The serving benchmark deliberately gives every request a unique front-loaded
 nonce and runs with the RAM cache off. That measures cold prefill and unique
-decode rows, not cache/coalescing. Shared-prefix (`--shared-prefix`) and
-identical-request workloads are measured separately; their scores must report
+decode rows, not cache/coalescing. Shared-prefix (`--cache-ram-bytes` at auto)
+and identical-request workloads are measured separately; their scores must report
 output throughput and TTFT, and the physical-token total has to be interpreted
 carefully because a cache hit or a coalesced follower logs `prefill_tokens=0`.
 The canonical 8/16/24/32 table and the latest on/off A/B live in
@@ -412,7 +417,8 @@ session's full KV cannot always stay resident.
 
 **Decision.** Use live session state, a RAM checkpoint tier with an explicit
 budget, and an opt-in disk tier owned by one process. The component cache shares
-immutable blocks; session mutation and rollback are explicit.
+immutable blocks on Flash-Next; Qwen3.8-27B copies rows on restore. Session mutation
+and rollback are explicit.
 
 **Consequences.** `--cache-ram-bytes off` is a real cold measurement, not a
 no-op: sessions still reuse their own live state. A shared-prefix workload
@@ -448,20 +454,41 @@ runner's measured state capacity, divided by the per-session **base state**
 transfer streams and allocator fragmentation. The shared paged-KV rows are not
 charged per session. The count is not capped by the widest execution plan; a
 wider pool serves additional sessions in later decode waves. Admission charges
-each request's prompt plus its requested output budget against the shared pool's
-free blocks and outstanding reservations; a request that does not fit stays
-queued and retries after 20 ms. The scheduler starts at one resident session
-and grows toward visible demand. In auto mode, KV exhaustion defers a request
-with its retained host snapshot and retries it; the fixed-mode deferral limit,
-snapshot-pending refusal and patience timeout do not apply. Auto servers
-disable device-row lending for prefix-cache checkpoints so completed requests
-cannot pin pool blocks.
+each request's complete private prompt plus a bounded output horizon (4096
+tokens for an explicit `max_tokens`, 512 for unlimited) and compares the
+resident sum against the shared pool's capacity, not its lagging free counter.
+A live shared prefix is charged once; followers budget only their private tail.
+The prompt size survives the move into the runner lease, and the budget ignores checkpoint
+frontiers: the executor may have mapped the whole prompt while the logical
+prefill position still sits at a 4k checkpoint. The pool's hard block limit
+still applies and KV exhaustion defers/replays excess requests. A request that
+does not fit stays queued and retries after 20 ms. On Flash-Next, live followers
+adopt a leader's full prefix blocks by refcount instead of copying them; only
+the partial tail block is copied. Admission charges the shared prefix once and
+budgets the private tail plus the output horizon, so a 64-request burst over
+one 9.7k-token prefix fits in a fraction of the shared pool;
+`gufo_kv_pool_shared_blocks` exposes the live COW sharing. The scheduler starts
+at one resident session and grows toward visible demand. In auto mode, KV
+exhaustion defers a request with its retained host snapshot and retries it; the
+fixed-mode deferral limit, snapshot-pending refusal and patience timeout do not
+apply. Completed prefix frontiers are still swapped to the host when the pool
+cannot cover the configured decode cohort's full contexts (up to eight), so
+finished requests cannot pin the device pool.
 
 **Consequences.** A single-user server stays at one session; a burst expands to
 the memory-and-demand limit and contracts when idle. On this host the uncapped
 Flash-Next fit is 150 sessions at 128k and 96 at 250k, but autoscaling is
 hard-capped at 64, so the hybrid plan reaches at most 64 rows. The effective
-count appears as `sessions=auto(N)` and `event=auto_sessions`. The trade-off is bounded latency: a request that exceeds
+count appears as `sessions=auto(N)` and `event=auto_sessions`.
+
+**Current operator profile (2026-11-08).** This deployment lowers the cap with
+`GUFO_AUTO_SESSIONS_MAX=40` and runs `--sessions auto --context 250000`, a
+17 GiB KV pool (742,656 tokens) and a 2 GiB RAM cache. The 40 states cost
+`40 x 303.75 MB ~= 12.2 GB` and leave about 8 GB host memory. Short requests
+fill all 40 sessions; 43 short requests run 40 active and 3 waiting. A 26k
+prompt plus the 4k output horizon costs ~30k tokens, so ~24 long requests fit;
+43 long requests run 24 active and 19 waiting. The 96/150 fits above remain
+historical and the 64-session hard cap remains the product limit. The trade-off is bounded latency: a request that exceeds
 the current free KV waits for residents to release blocks instead of returning
 an error. Queue-full admission (`--max-pending`) and non-KV errors still fail
 fast. Non-text modalities keep their own fixed queues.

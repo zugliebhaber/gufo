@@ -1,7 +1,11 @@
 # Benchmark methodology
 
-Build with `nix build` and measure binaries under `result/bin`. Per-model
-results and qualification gaps live in:
+Build with `nix build` and measure binaries under `result/bin`. The current
+serving deployment profile (40 sessions, 17 GiB KV pool, 2 GiB cache, ~8 GB
+host headroom) is documented in
+[docs/README](README.md#current-deployment-profile-2026-11-08); benchmark
+tables and retained `artifacts/` reports keep the configuration they were
+measured with. Per-model results and qualification gaps live in:
 
 - [DeepSeek V4 Flash](models/deepseek-v4-flash/BENCHMARKS.md)
 - [Qwen3.8 27B](models/qwen3.8-27b/BENCHMARKS.md)
@@ -102,10 +106,13 @@ The canonical table is deliberately cold: unique front-loaded nonces and
 `--cache-ram-bytes off`. Do not use it to claim prefix-cache or request-
 coalescing gains. Run those workloads separately:
 
-- **Shared-prefix cache:** `--shared-prefix` with the RAM cache at auto. Report
+- **Shared-prefix cache:** `--cache-ram-bytes` at auto, not `off`. Report
   output tok/s, TTFT and wall time. A cache hit logs `prefill_tokens=0` for the
   restored part, so the physical-token sum can fall even when output and TTFT
   improve (c32: 94.67 -> 119.94 output tok/s, +26.7%; 13.87 -> 0.223 s TTFT).
+  On Flash-Next, live followers adopt full prefix blocks by refcount; only the
+  partial tail is copied, and `gufo_kv_pool_shared_blocks` exposes the sharing.
+  Qwen3.8-27B copies rows on restore.
 - **Request coalescing:** `GUFO_REQUEST_COALESCE=1` on byte-identical greedy
   requests. The leader owns the only prefill/KV; followers log
   `prefill_tokens=0`. A 32-identical batch measured 44.410 -> 4.891 s (9.08x;

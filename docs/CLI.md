@@ -81,10 +81,15 @@ The feature list below uses the conceptual/config names (for example
   [N-LEVERS scope](models/qwen3.8-flash-next/N-LEVERS.md#request-coalescing-opt-in).
 - **Shared-prefix cache** uses the RAM/disk continuation cache. Leave
   `--cache-ram-bytes` at auto for repeated/shared prefixes; `off` is the cold
-  benchmark. A shared-prefix c32 run improved output from 94.67 to 119.94
-  tok/s (+26.7%) and TTFT from 13.87 s to 0.223 s, while the physical-token
-  total fell because cached prefill is logged as zero. Report output/TTFT for
-  cached workloads. Details: [Flash-Next benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md).
+  benchmark and also disables cross-request shared-prefix waiting, so prefix
+  hits and the `cache` log column stay at zero. On Flash-Next, live followers
+  adopt the leader's full prefix blocks by refcount and copy only the partial
+  tail; `gufo_kv_pool_shared_blocks` exposes the sharing. Qwen3.8-27B copies
+  rows on restore. A shared-prefix c32 run
+  improved output from 94.67 to 119.94 tok/s (+26.7%) and TTFT from 13.87 s to
+  0.223 s, while the physical-token total fell because cached prefill is
+  logged as zero. Report output/TTFT for cached workloads. Details:
+  [Flash-Next benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md).
 - **Cold retention** is opt-in: `--cache-retain-cold` keeps snapshots for
   unique single-turn prompts. Without it, a prompt is retained only when there
   is evidence of reuse (a hit, a waiting peer sharing the prefix, or a
@@ -295,10 +300,13 @@ These apply to every modality, before or after the subcommand:
   pool after model load from the measured per-session **base state**, not the
   full context: the uncapped fit is 96 sessions at 250k and 150 at 128k, but
   autoscaling is hard-capped at 64 (the environment variable may only lower
-  it). It starts with one resident session, grows
-  toward queued demand, and returns to one when idle. Admission charges each
-  request's prompt plus requested output against the shared KV pool; a request
-  that does not fit stays queued and retries. Requests blocked by VRAM are
+  it). This deployment uses `GUFO_AUTO_SESSIONS_MAX=40`, a 17 GiB KV pool
+  (742,656 tokens) and a 2 GiB cache, leaving about 8 GB host memory. It starts
+  with one resident session, grows toward queued demand, and returns to one when
+  idle. Admission charges each
+  request's complete private prompt plus a bounded output horizon against the
+  shared KV pool; a live shared prefix is charged once. A request that does not
+  fit stays queued and retries. Requests blocked by VRAM are
   deferred and retried instead of failed; only client cancellation or a real
   model error ends them. See the
   [auto sessions contract](SERVER.md#auto-sessions). This option applies to LLM
@@ -328,8 +336,9 @@ These apply to every modality, before or after the subcommand:
   separate, opt-in `trace` file records content. Debug admission lines do name
   the client by the peer IP address of its connection. At INFO, text serving
   emits a 10 s interval table (every row is the delta since the previous row)
-  with `adm` for newly accepted, `done` for finished request counts and `ctx%`
-  for shared KV-pool usage, plus a once-per-minute completed-request line;
+  with `adm` for newly accepted, `done` for finished, `queue` for total waiting
+  depth and `ctx%` for shared KV-pool usage, plus a once-per-minute
+  completed-request line;
   per-request receipt/completion,
   scheduler batch/prefill and cache acquire/retention lines are DEBUG. See
   [server logs](SERVER.md#troubleshooting-logs).

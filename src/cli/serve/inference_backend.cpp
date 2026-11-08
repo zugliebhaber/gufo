@@ -2613,10 +2613,12 @@ public:
     }
     std::optional<std::size_t> shared_capacity;
     std::optional<std::size_t> shared_free;
+    std::optional<std::size_t> shared_blocks;
     if (const auto pool = model_->KvPoolSnapshot()) {
       const auto block = std::size_t{models::qwen::kKvBlockTokens};
       shared_capacity = std::size_t{pool->capacity_blocks} * block;
       shared_free = std::size_t{pool->free_blocks} * block;
+      shared_blocks = std::size_t{pool->shared_blocks};
     }
     // Admission charges complete snapshot payloads. Flash-Next can retain
     // mutable state and protected K/V rows in private device storage.
@@ -2635,6 +2637,7 @@ public:
         .shared_kv_capacity_tokens = shared_capacity,
         .shared_kv_free_tokens = shared_free,
         .shared_kv_block_tokens = std::size_t{models::qwen::kKvBlockTokens},
+        .shared_kv_shared_blocks = shared_blocks,
         .requires_device_runtime_lock = true,
     };
   }
@@ -3391,7 +3394,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 std::clamp<std::size_t>(model_session_count, 1, 8)),
             .pool_sessions = static_cast<std::uint32_t>(model_session_count),
             .kv_pool_budget_bytes = kv_pool_budget_bytes,
-            .device_row_lending = session_count != 0,
+            // Live prefix sharing borrows blocks the source already owns, so
+            // it is safe even when the pool covers only one context. Keeping
+            // a completed frontier is gated separately by RetainDeviceRows.
+            .device_row_lending = true,
             .rope_scaling = rope_scaling,
         },
         &load_error);

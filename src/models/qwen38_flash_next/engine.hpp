@@ -64,11 +64,11 @@ struct ModelOptions {
   /// a full context per session. Sessions map blocks lazily, so the pool only
   /// has to cover the tokens actually in flight.
   std::uint64_t kv_pool_budget_bytes = 0;
-  /// A pool sized for one session can be smaller than the server's admitted
-  /// batch. In that case a cache checkpoint must keep its rows on the host:
-  /// lending device rows would pin every pool block to a completed request and
-  /// starve requests still waiting to prefill. Auto-session servers disable
-  /// lending because their final session count is resolved after model load.
+  /// Live prefix sharing may borrow device rows even from a pool sized for a
+  /// single context: the source already owns those blocks and the borrower
+  /// takes a reference. Keeping a completed request's live frontier is gated
+  /// separately by the adapter's headroom check, so a small auto-session pool
+  /// releases completed rows instead of pinning every block.
   bool device_row_lending = true;
   /// Static YaRN scaling, derived by the caller (serve, bench) from the
   /// requested context via `RopeScalingForContext`. Empty leaves the

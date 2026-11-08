@@ -93,6 +93,13 @@ inline std::atomic<std::int64_t>& RequestsDeferred() {
   static std::atomic<std::int64_t> count{0};
   return count;
 }
+// Requests parked outside the pending queue while waiting for a shared
+// prefix, a KV retry or preemption replay. `queued` in the log is the sum of
+// this and RequestsDeferred.
+inline std::atomic<std::int64_t>& RequestsWaiting() {
+  static std::atomic<std::int64_t> count{0};
+  return count;
+}
 // RECOMPUTE preemption counters: model states released and tokens replayed,
 // never swapped out and back.
 inline std::atomic<std::uint64_t>& TotalPreemptions() {
@@ -133,6 +140,10 @@ inline std::atomic<std::uint64_t>& KvPoolFreeTokens() {
 }
 inline std::atomic<std::uint64_t>& KvPoolBlockTokens() {
   static std::atomic<std::uint64_t> count{1};
+  return count;
+}
+inline std::atomic<std::uint64_t>& KvPoolSharedBlocks() {
+  static std::atomic<std::uint64_t> count{0};
   return count;
 }
 // Latest 10 s interval row, published by LogStats. These gauges mirror the
@@ -178,6 +189,14 @@ inline std::atomic<std::uint64_t>& LastStatsFailed() {
   return value;
 }
 inline std::atomic<std::uint64_t>& LastStatsCacheHits() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+inline std::atomic<std::uint64_t>& LastStatsQueue() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+inline std::atomic<std::uint64_t>& LastStatsQueueMax() {
   static std::atomic<std::uint64_t> value{0};
   return value;
 }

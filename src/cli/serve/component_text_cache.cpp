@@ -1790,7 +1790,9 @@ std::size_t ComponentTextCache::Lease::Commit(
   // adopts them, and a completed request would then hold blocks a waiting one
   // needs. Ending the request releases the slot instead; the published host
   // checkpoint still restores the same prefix, only through a copy.
-  if (live.empty() || !impl_->cache->resources->adapter->RetainDeviceRows()) {
+  const bool retain_device_rows =
+      impl_->cache->resources->adapter->RetainDeviceRows();
+  if (live.empty() || !retain_device_rows) {
     Invalidate();
     return bytes;
   }

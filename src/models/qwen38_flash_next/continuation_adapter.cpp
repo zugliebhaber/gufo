@@ -848,10 +848,10 @@ bool ContinuationAdapter::LendDeviceRows() const {
   const std::uint32_t per_session =
       (context_ + models::qwen::kKvBlockTokens - 1) /
       models::qwen::kKvBlockTokens;
-  const std::uint64_t coverage =
-      std::uint64_t{std::max<std::uint32_t>(1, model_->DecodeConcurrency())} *
-      per_session;
-  return gauges->capacity_blocks >= coverage;
+  // A live borrow shares blocks the source already owns; one full context is
+  // enough for that. Retaining a completed frontier needs the larger headroom
+  // checked by RetainDeviceRows below.
+  return gauges->capacity_blocks >= per_session;
 }
 void ContinuationAdapter::RecordShare(const models::qwen::KvBlockTable* table,
                                       cache::ComponentId id, Rows first,
@@ -1142,7 +1142,22 @@ bool ContinuationAdapter::Validate(
   return true;
 }
 bool ContinuationAdapter::RetainDeviceRows() const {
-  return LendDeviceRows();
+  if (!LendDeviceRows())
+    return false;
+  const auto gauges = PoolGauges();
+  if (!gauges)
+    return true;
+  const std::uint32_t per_session =
+      (context_ + models::qwen::kKvBlockTokens - 1) /
+      models::qwen::kKvBlockTokens;
+  const std::uint64_t coverage =
+      std::uint64_t{std::max<std::uint32_t>(1, model_->DecodeConcurrency())} *
+      per_session;
+  // Keeping a completed live frontier pins its device rows until the slot is
+  // reused. Only do that when the pool can cover one full context per resident
+  // session; otherwise the host snapshot is the durable copy and the slot is
+  // released immediately.
+  return gauges->capacity_blocks >= coverage;
 }
 std::optional<cache::KvPoolGauges> ContinuationAdapter::PoolGauges() const {
   if (!model_ || !model_->executor_)
@@ -1158,9 +1173,9 @@ std::optional<cache::KvPoolGauges> ContinuationAdapter::PoolGauges() const {
                                     layers * c.AttentionKvDim() *
                                     sizeof(std::uint16_t);
   const auto snapshot = pool->Snapshot();
-  return cache::KvPoolGauges{snapshot.capacity_blocks, snapshot.live_blocks,
-                             snapshot.free_blocks, snapshot.high_water_blocks,
-                             block_bytes};
+  return cache::KvPoolGauges{
+      snapshot.capacity_blocks,   snapshot.live_blocks,   snapshot.free_blocks,
+      snapshot.high_water_blocks, snapshot.shared_blocks, block_bytes};
 }
 bool ContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
   State* resetting = nullptr;

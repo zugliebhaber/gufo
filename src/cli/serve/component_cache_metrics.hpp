@@ -89,10 +89,13 @@ inline json::Value ComponentCacheJson(const ComponentCacheMetrics& value) {
     gauges["free_blocks"] = static_cast<std::size_t>(pool.free_blocks);
     gauges["high_water_blocks"] =
         static_cast<std::size_t>(pool.high_water_blocks);
+    gauges["shared_blocks"] = static_cast<std::size_t>(pool.shared_blocks);
     gauges["block_bytes"] = static_cast<std::size_t>(pool.block_bytes);
     gauges["capacity_bytes"] =
         static_cast<std::size_t>(bytes(pool.capacity_blocks));
     gauges["live_bytes"] = static_cast<std::size_t>(bytes(pool.live_blocks));
+    gauges["shared_bytes"] =
+        static_cast<std::size_t>(bytes(pool.shared_blocks));
     gauges["high_water_bytes"] =
         static_cast<std::size_t>(bytes(pool.high_water_blocks));
     result["global_kv_pool"] = std::move(gauges);

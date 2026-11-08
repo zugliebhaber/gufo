@@ -24,7 +24,11 @@ and its plain-text twin `n-levers-status.txt`; regenerate both with
   Canonical unique prompts do not trigger it.
 - Shared-prefix cache: output 94.67 -> 119.94 tok/s (+26.7%) and TTFT
   13.87 -> 0.223 s; the physical-token sum falls because cached prefill is
-  logged as zero. Report output/TTFT for that workload.
+  logged as zero. Report output/TTFT for that workload. Live followers also
+  adopt full prefix blocks by refcount and copy only the partial tail;
+  `gufo_kv_pool_shared_blocks` exposes the sharing, and on a 64-session pool
+  64 requests over one 9.7k-token prefix fit at roughly 22 % of a 250k pool.
+  The current 40-session/17 GiB profile runs 40 such requests at 3.4 %.
 - Details: [BENCHMARKS](BENCHMARKS.md) and
   [ARCHITECTURE](../../ARCHITECTURE.md).
 
@@ -70,7 +74,9 @@ The width curve on the same run is 243.87 / 312.87 / 323.00 / 342.76 tok/s for
 8 / 16 / 24 / 32 sessions. The pre-reboot reference measured 231.61 / 277.14 /
 294.00 / 305.19 at identical settings, i.e. the fresh boot is 10-13% faster with
 unchanged code paths; that delta is host state (clocks, no memory pressure), not
-the N6 code, and it is exactly the effect N6 wants to control for.
+the N6 code, and it is exactly the effect N6 wants to control for. The current
+deployment uses a 40-session cap with a 17 GiB pool; the 8/16/24/32 table is
+historical and retains its measured configuration.
 
 Per-request TG at c32 falls to 4.37 tok/s and TTFT rises to 16.1 s; the gain is
 aggregate throughput, not latency.

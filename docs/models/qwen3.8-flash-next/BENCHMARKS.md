@@ -356,9 +356,10 @@ plateau and wall time scales with the request count.
 
 ## Auto sessions at 250k (2026-11-06)
 
-The 2026-11-06 build changed the auto contract: the pool is sized from the
-per-session **base state** (KV block table, index and recurrent state) instead
-of the full context, with a 25 % reserve for cache backing, transfer streams
+**Historical measurement.** The 2026-11-06 build changed the auto contract: the
+pool was sized from the per-session **base state** (KV block table, index and
+recurrent state) instead of the full context, with a 25 % reserve for cache
+backing, transfer streams
 and allocator fragmentation. The shared paged-KV rows are charged only when a
 request maps them, and admission compares each request's prompt plus requested
 output against the pool's free blocks and outstanding reservations.
@@ -401,6 +402,18 @@ no request-state claim failures and no KV-degradation aborts**. The single
 `kv_admission_deferred`/`kv_exhaustion_degraded` case is covered by the
 scheduler unit test, which blocks an arrival against a synthetic shared pool
 and resumes it when blocks are freed.
+
+**Current admission and operator profile (2026-11-08).** Newer builds charge
+the complete private prompt plus a bounded 4096-token output horizon (512 for
+unlimited) against the pool capacity, not its lagging free counter. A live
+shared prefix is charged once; followers reserve only their private tail, and
+full prefix blocks are adopted by refcount. This deployment lowers the cap with
+`GUFO_AUTO_SESSIONS_MAX=40`, runs a 17 GiB pool (742,656 tokens) and a 2 GiB
+cache, and leaves about 8 GB host memory. Short requests fill 40 sessions;
+43 short requests run 40 active and 3 waiting. A 26k prompt plus the 4k horizon
+costs ~30k tokens, so ~24 long requests fit; 43 long requests run 24 active and
+19 waiting. The 96/150 session counts, 250,112-token pool and 1,954-block
+high-water figures above are historical 2026-11-06 measurements.
 
 ## Wide decode plans (2026-11-06)
 
@@ -457,11 +470,11 @@ PP** (see
 
 A deterministic run (temperature 0, top-k 1, reasoning off, 8 output tokens,
 256 fixed prompts) produced **256/256 identical content strings** at 32 and
-256 rows. The production auto path uses the same hybrid: on the 250k server it
-resolved 96 sessions and served 120 short requests with plans `w96`/`w83` in
-48.28 s versus 52.76 s for the 32-row run, with 120/120 HTTP 200. The 128k auto
-path resolves 150 sessions and therefore advertises up to 150 rows; short
-contexts use the full 256.
+256 rows. In that 2026-11-06 build, the production auto path uses the same
+hybrid: on the 250k server it resolved 96 sessions and served 120 short
+requests with plans `w96`/`w83` in 48.28 s versus 52.76 s for the 32-row run,
+with 120/120 HTTP 200. The 128k auto path resolved 150 sessions and therefore
+advertised up to 150 rows; short contexts used the full 256.
 
 ### Cohorts for TG (2026-11-06)
 

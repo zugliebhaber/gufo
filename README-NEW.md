@@ -64,7 +64,7 @@ scheduler, the paged pool and the kernels are designed around that trade:
 
 ```mermaid
 flowchart TB
-    Q["Queued requests<br/>1024 clients"] --> A["Admission<br/>prompt + output vs free KV"]
+    Q["Queued requests<br/>1024 clients"] --> A["Admission<br/>private prompt + horizon vs pool"]
     A -->|fits| C["Cohort prefill<br/>min(32, prefilling depth)"]
     A -->|does not fit| W["Deferred retry<br/>host snapshot kept"]
     W --> A
@@ -97,7 +97,7 @@ pool and on batch throughput; the sections below explain the mechanism.
 | Cache | Prefix-cache hit-rate metrics | Makes reuse visible per request and globally | Lets throughput work target real cache value |
 | Cache | Paged row-address hoisting | Resolves a block base once for K and V | Removes paging overhead from prefill |
 | Cache | Lazy mapping + `--kv-pool-bytes` | Charges only written blocks | Frees device memory for more sessions |
-| Cache | KV pool gauges | Capacity, live, free and high-water blocks | Makes the reservation verifiable |
+| Cache | KV pool gauges | Capacity, live, free, high-water and shared blocks | Makes reservation and prefix sharing verifiable |
 | Cache | KV exhaustion degradation | Keeps the prefilled state as a host snapshot | Completes a tight-pool round instead of failing requests |
 | Cache | Retention gating (`--cache-retain-cold`) | Does not retain unique cold prompts | Leaves RAM and backing for reusable state |
 | Cache | Shared host-snapshot counters | Proves cross-request snapshot dedup | Avoids duplicating the same prefix in host RAM |
@@ -141,8 +141,9 @@ records before any mutation; a restore re-maps the table so an adopted block
 cannot leak into a later request. The free list is a FIFO/LRU ring, so the
 oldest free block is reused instead of the most recently released one.
 
-**Why it matters for the shared pool:** full prefix blocks are shared without a
-copy, while the writable tail stays private. **Why it matters for throughput:**
+**Why it matters for the shared pool:** on Flash-Next, full prefix blocks are
+shared without a copy, while the writable tail stays private. **Why it matters
+for throughput:**
 a shared-prefix cohort skips repeated prefill and keeps more sessions resident.
 
 ```mermaid
@@ -249,8 +250,9 @@ batch stays full and new demand can join the next wave.
 ### Dynamic prefill budget and cohort prefill
 
 `--prefill-chunk` is an upper bound. The scheduler shrinks the actual pass to
-what the free KV pool can hold, and admission charges each request's prompt
-plus requested output against the pool. Cold prompts share a prefill pass:
+what the free KV pool can hold, and admission charges each request's complete
+private prompt plus a bounded output horizon against the pool. A live shared
+prefix is charged once. Cold prompts share a prefill pass:
 the cap is `min(32, prefilling queue depth)`, and the stable-prefix chunk
 boundary keeps the deterministic 256-prompt gate exact at cohort 8/16/32.
 `GUFO_PREFILL_COHORT` overrides the cap for experiments;
@@ -295,10 +297,37 @@ indexer and recurrent state, not the shared KV rows) and keeps a 25 % reserve
 for cache backing, transfer streams and allocator fragmentation. The uncapped
 base-state fit on this host is **96 sessions at 250k** and **150 at 128k**;
 autoscaling is hard-capped at **64 sessions**, and
-`GUFO_AUTO_SESSIONS_MAX` can only lower that ceiling. The scheduler starts with
-**one resident session**, grows toward visible demand, and returns to one when
-idle. An admission that does not fit the shared pool stays queued and retries;
-it is not failed.
+`GUFO_AUTO_SESSIONS_MAX` can only lower that ceiling.
+
+**Current deployment profile (2026-11-08).** This host lowers the cap with
+`GUFO_AUTO_SESSIONS_MAX=40` and runs `--sessions auto --context 250000`, a
+**17 GiB** KV pool (`--kv-pool-bytes 18253611008`, 742,656 tokens) and a
+**2 GiB** RAM cache (`--cache-ram-bytes 2147483648`). The 40 states cost
+`40 x 303.75 MB ~= 12.2 GB`; about **8 GB host memory** remains available.
+Short requests can use all 40 sessions; 43 short requests run 40 active and 3
+waiting. A 26k prompt plus the 4k output horizon costs ~30k tokens, so the
+17 GiB pool admits about **24** long requests; 43 long requests run 24 active
+and 19 waiting. The product hard cap remains 64; see
+[docs/README.md](docs/README.md#current-deployment-profile-2026-11-08).
+
+The scheduler starts with **one resident session**, grows toward visible demand,
+and returns to one when idle. Admission reserves the complete private prompt plus a bounded 4096-token
+output horizon (512 for unlimited requests), not the full client `max_tokens`,
+so new long-output requests can page in while existing requests decode. A live
+shared prefix is charged once; each follower reserves only its private tail.
+The resident sum is checked against the shared pool capacity, not its lagging
+free counter: the executor may already have mapped the whole prompt at a 4k
+checkpoint. The hard pool limit remains enforced by block mapping and KV
+exhaustion. An admission that does not fit stays queued and retries; it is not
+failed. For Qwen3.8-27B and Flash-Next, prefix lookup uses a radix-style
+compressed token-prefix tree per compatibility identity; it indexes live
+frontiers and retained checkpoints, not the KV rows themselves. Prefix reuse
+and shared-prefix waiting require the RAM cache; `--cache-ram-bytes off` keeps only a request's own live state and
+reports zero cache hits. On Flash-Next, live prefix blocks are adopted by
+refcount (only the partial tail is copied); `gufo_kv_pool_shared_blocks`
+exposes them. On a 64-session pool,
+64 requests over a 9.7k-token prefix peaked at 22 % of a 250k pool; the current
+40-session/17 GiB profile ran 40 at 3.4 % and queues the rest.
 
 The 96 are the state-capacity result for a 250k context: per-session base state
 is ~304 MB (dominated by the ~217 MB indexer cache at 250k, plus 56.6 MB BF16
@@ -308,8 +337,9 @@ shared KV pool is a separate admission constraint; 96 session slots do not
 mean 96 full-context conversations.
 
 **Why it matters for the shared pool:** the pool is sized from base state, not
-from `sessions x full context`, and admission charges the actual request.
-**Why it matters for throughput:** the decoded plan scales with the resolved
+from `sessions x full context`, and admission charges the actual private
+prompt plus the output horizon. **Why it matters for throughput:** the decoded
+plan scales with the resolved
 pool, while a single-user server still pays for only one resident session.
 
 ### Request coalescing (opt-in)
@@ -456,9 +486,10 @@ This is a completed benchmark run, not the live server log. The columns are:
 - `fail` — failed requests, `cache` — cache hits.
 
 The live server prints a 10 s interval table with `win pp/s` / `win tg/s`,
-`adm` (newly accepted requests), `done` (finished requests), `win s` and
-`ctx%` (used shared KV-pool memory); every row is the delta since the previous
-row, so idle rows report zero rather than the run average.
+`adm` (newly accepted requests), `done` (finished requests), `queue` (total
+waiting requests), `win s` and `ctx%` (used shared KV-pool memory); every row is the
+delta since the previous row, so idle rows report zero rather than the run
+average.
 
 ```text
 conc |  pp/s req  tg/s req  TTFT ms |  tot pp/s  tot tg/s   req/s  wall s  fail  cache
@@ -608,7 +639,7 @@ Settings that matter for the two design goals:
 | --- | --- | --- |
 | context per session | `--context N` | Long prompts or many sessions; Flash-Next above 262144 needs `--enable-yarn` |
 | resident sessions | `--sessions N\|auto` | `auto` fits the pool from base state; fixed values cap the resident count |
-| auto-session cap | `GUFO_AUTO_SESSIONS_MAX=N` | lower the hard 64-session autoscaling cap; the value may never raise it |
+| auto-session cap | `GUFO_AUTO_SESSIONS_MAX=N` | lower the hard 64-session autoscaling cap; this deployment uses 40 |
 | prefill work unit | `--prefill-chunk N` | Larger units amortise expert reads; the scheduler also shrinks to free KV |
 | RAM prefix cache | `--cache-ram-bytes N\|off` | Keep repeated/shared prefixes warm; `off` for cold benchmark runs |
 | cold retention | `--cache-retain-cold` | Opt unique single-turn prompts into retention |
@@ -637,6 +668,10 @@ gufo serve llm --model MODEL --context 4096 --sessions 256 --cache-ram-bytes off
 
 # Long context: auto sessions resolve to the state-capacity fit, capped at 64
 gufo serve llm --model MODEL --context 250000 --sessions auto
+
+# Current long-prompt profile: 40 sessions, 17 GiB pool, 2 GiB cache
+GUFO_AUTO_SESSIONS_MAX=40 gufo serve llm --model MODEL --context 250000 \
+  --sessions auto --kv-pool-bytes 18253611008 --cache-ram-bytes 2147483648
 
 # Single-user latency: one session, optional MTP drafts
 gufo serve llm --model MODEL --sessions 1 --speculative mtp --mtp-model DRAFT

@@ -24,11 +24,16 @@ code addition, the entry says so.
 | Serving | Decode tile ladder and 8k+1 hold-back | Avoid the 9/17/25/33-row weight-read dips and reuse full 8/16/32/48 tiles | [BATCH-THROUGHPUT](BATCH-THROUGHPUT.md) |
 | Serving | Wide decode plans up to 256 rows | Amortise dense projections and expert reads over a full resident cohort | [Flash-Next README](models/qwen3.8-flash-next/README.md) |
 | Serving | `--sessions auto` | Resolve the session pool from measured state capacity, grow with demand, defer instead of failing | [SERVER](SERVER.md#auto-sessions) |
+| Serving | Full-prompt admission budget | Reserve the complete private prompt plus a 4096-token output horizon against pool capacity; checkpoint frontiers and moved-from prompts cannot shrink the budget | [SERVER](SERVER.md#auto-sessions), [ARCHITECTURE](ARCHITECTURE.md) |
+| Serving | Radix-style prefix index | On Qwen3.8-27B and Flash-Next, a compressed token-prefix tree per compatibility identity selects the deepest exact live-frontier or checkpoint boundary; KV rows stay in the refcounted block pool | [KV cache](KV-CACHE.md#finding-reuse), [Visual guide](KV-CACHE-VISUAL.md) |
+| Serving | Live prefix KV sharing (COW) | On Flash-Next, borrow a live leader's full prefix blocks and adopt them by refcount; only the partial tail is copied. Qwen3.8-27B copies rows on restore. `gufo_kv_pool_shared_blocks` exposes the sharing | [SERVER](SERVER.md#auto-sessions), [PROMETHEUS](PROMETHEUS.md) |
+| Serving | Prefix-aware admission | A shared prefix is charged once; each follower reserves only its private tail plus the output horizon, so 40 requests with the same 9.7k prefix fit beside each other in the current 40-session/17 GiB profile (a 64-session pool can run 64) | [SERVER](SERVER.md#auto-sessions) |
+| Serving | Cache-off prefix isolation | `--cache-ram-bytes off` keeps only a request's own live state, so shared-prefix waits cannot pin device KV without a retention budget | [CLI](CLI.md), [SERVER](SERVER.md#auto-sessions) |
 | Serving | Request coalescing (opt-in) | Let byte-identical greedy requests share one prefill and decode stream | [N-LEVERS](models/qwen3.8-flash-next/N-LEVERS.md#request-coalescing-opt-in) |
 | Serving | Watchdog enabled by default | Turn a wedged device into a restartable `device_lost` instead of a silent hang | [SERVER](SERVER.md) |
 | Serving | HTTP burst scaling | Accept and drain 256+ simultaneous connections without listener resets | [PROGRESS](../PROGRESS.md) |
 | Cache | Paged attention and a shared KV pool | Bound KV memory with request block tables instead of a full private plane per session | [KV-CACHE-VISUAL](KV-CACHE-VISUAL.md) |
-| Cache | Block sharing, adoption and copy-on-write tails | Serve shared prefixes without duplicating full blocks | [PROGRESS](../PROGRESS.md), [KV-CACHE](KV-CACHE.md) |
+| Cache | Block sharing, adoption and copy-on-write tails | On Flash-Next, serve shared prefixes without duplicating full blocks; Qwen3.8-27B copies rows on restore | [PROGRESS](../PROGRESS.md), [KV-CACHE](KV-CACHE.md) |
 | Cache | Prefix-cache hit-rate metrics | Measure reuse per request and globally instead of inferring it from timing | [PROGRESS](../PROGRESS.md) |
 | Cache | Lazy KV mapping and `--kv-pool-bytes` | Charge only mapped blocks and cap the pool against real demand | [KV-CACHE-VISUAL](KV-CACHE-VISUAL.md) |
 | Cache | KV pool gauges | Expose capacity, live, free and high-water blocks in usage and logs | [PROGRESS](../PROGRESS.md) |
@@ -74,9 +79,12 @@ Evidence: `PROGRESS.md` `TP-P1`, `TextPreemptionPolicy::kRecompute`,
 
 The configured `--prefill-chunk` is an upper bound. The scheduler shrinks the
 actual pass to what the free KV pool can hold and starts the next chunk only
-when it fits. Admission charges each request's prompt plus requested output
-against the pool; a request that does not fit stays queued and retries instead
-of taking the whole pass or failing.
+when it fits. Admission charges each request's complete private prompt plus a
+bounded output horizon (4096 tokens for an explicit `max_tokens`, 512 for
+unlimited) against the pool capacity; a live shared prefix is charged once.
+The resident sum is used instead of the lagging free counter so a 4k
+checkpoint frontier or an asynchronous cache restore cannot hide mapped rows. A request that does not fit stays queued and retries
+instead of taking the whole pass or failing.
 
 Purpose: a long prompt must not overrun the pool or starve the decoders, and a
 short prompt must not wait behind a full-context prefill.
@@ -139,6 +147,10 @@ reserve. The scheduler starts with one resident session, grows toward visible
 demand, returns to one when idle, and defers KV-blocked requests instead of
 failing them. Autoscaling is hard-capped at 64 sessions;
 `GUFO_AUTO_SESSIONS_MAX=N` may lower that ceiling but never raise it.
+The current deployment uses `GUFO_AUTO_SESSIONS_MAX=40`, a 17 GiB KV pool
+(742,656 tokens) and a 2 GiB RAM cache, leaving about 8 GB host memory: short
+requests fill 40 sessions, while the pool admits about 24 concurrent
+26k-prompt + 4k-horizon requests.
 Fixed-session servers keep the old behavior; image, audio, embedding and video
 servers do not accept `auto`.
 
@@ -457,12 +469,13 @@ endpoints.
   concurrency for a model. Purpose: find the batch knee without a bespoke
   harness. Evidence: the two scripts and `PROGRESS.md` `TP-P1`.
 - **Periodic text statistics.** Text serving logs a 10 s interval table
-  (`conc | pp/s req tg/s req TTFT | win pp/s win tg/s adm done win s ctx% fail cache`)
+  (`conc | pp/s req tg/s req TTFT | win pp/s win tg/s adm done queue win s ctx% fail cache`)
   and a once-per-minute completed-request line. Every row reports the
   difference from the previous snapshot, so idle rows show zero rather than
   lifetime averages. `conc` is the live count, `adm` counts newly accepted
-  requests, `done` counts finished requests in the interval and `ctx%` is the
-  used shared KV-pool memory over capacity. The table
+  requests, `done` counts finished requests in the interval, `queue` is the
+  current total waiting depth and `ctx%` is the used shared KV-pool memory
+  over capacity. The table
   header follows the minute line; per-request receipt/completion, scheduler
   batch/prefill and cache acquire/retention details move to DEBUG. Purpose:
   keep the log vLLM-like and correlate the shared pool with interval

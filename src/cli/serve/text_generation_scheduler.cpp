@@ -90,6 +90,15 @@ struct ScheduledRequest {
   std::uint64_t id{0};
   std::string client_id{"anonymous"};
   std::vector<TextRunnerToken> prompt;
+  /// Token count of `prompt`. Admission must keep budgeting it after the
+  /// vector moves into the runner lease; a moved-from prompt would otherwise
+  /// reserve only the output horizon and overcommit the KV pool.
+  std::size_t prompt_tokens{0};
+  /// Prefix tokens shared with a live resident. Those blocks are mapped once
+  /// and adopted by reference, so admission budgets only the private tail and
+  /// the output horizon. Zero until a shared-prefix wait or a verified live
+  /// restore sets it.
+  std::size_t shared_prefix_tokens{0};
   std::shared_ptr<const TextPromptContext> prompt_context;
   bool cache_prompt{true};
   bool cache_persist{true};
@@ -202,6 +211,7 @@ struct SharedKvPoolTokens {
   std::size_t capacity{0};
   std::size_t free{0};
   std::size_t block{1};
+  std::size_t shared_blocks{0};
 };
 
 struct PendingClient {
@@ -803,21 +813,27 @@ struct TextGenerationScheduler::Impl {
     return batch_limit.load(std::memory_order_acquire);
   }
 
-  /// Conservative output budget for an unlimited request. A request that
-  /// names max_tokens reserves exactly that amount instead.
+  /// Conservative output budget for an unlimited request.
   static constexpr std::size_t kAutoOutputReserveTokens = 512;
+  /// Admission reserves only this much of an explicit max_tokens budget.
+  /// Reserving the full client limit made long-output requests occupy the
+  /// whole shared pool before they had generated anything, so only a handful
+  /// could run in parallel. The hard pool limit still applies at block
+  /// allocation time; KV exhaustion keeps the excess requests replayable.
+  static constexpr std::size_t kAdmissionOutputReserveTokens = 4096;
   static constexpr auto kKvAdmissionRetry = std::chrono::milliseconds{20};
 
   [[nodiscard]] static std::size_t OutputReserveTokens(
       const ScheduledRequest& request) noexcept {
     if (request.output_limit_explicit)
-      return request.token_limit;
+      return std::min<std::size_t>(request.token_limit,
+                                   kAdmissionOutputReserveTokens);
     return std::min<std::size_t>(request.token_limit, kAutoOutputReserveTokens);
   }
 
   [[nodiscard]] static std::size_t AdmissionEstimateTokens(
       const ScheduledRequest& request) noexcept {
-    return request.prompt.size() + OutputReserveTokens(request);
+    return request.prompt_tokens + OutputReserveTokens(request);
   }
 
   [[nodiscard]] std::optional<SharedKvPoolTokens> SharedKvPool()
@@ -831,21 +847,45 @@ struct TextGenerationScheduler::Impl {
           .capacity = *claim.shared_kv_capacity_tokens,
           .free = *claim.shared_kv_free_tokens,
           .block = claim.shared_kv_block_tokens.value_or(1),
+          .shared_blocks = claim.shared_kv_shared_blocks.value_or(0),
       };
     } catch (...) {
       return std::nullopt;
     }
   }
 
-  /// KV tokens the resident batch has already claimed but not mapped yet.
-  /// Admission subtracts this from the pool's free count so a burst cannot
-  /// reserve the same free blocks several times before the first prefill maps
-  /// them.
-  [[nodiscard]] std::size_t ResidentKvReservation(
+  [[nodiscard]] static std::size_t RoundKvTokens(std::size_t tokens,
+                                                 std::size_t block) noexcept {
+    if (block <= 1)
+      return tokens;
+    const auto remainder = tokens % block;
+    return remainder == 0 ? tokens : tokens + (block - remainder);
+  }
+
+  /// Full private KV a request will hold: its prompt, the tokens it already
+  /// generated, and the admission output horizon. The executor maps the whole
+  /// prompt during the first prefill pass even when the logical frontier stops
+  /// at a checkpoint, so admission budgets the prompt, not `prefill_position`.
+  [[nodiscard]] static std::size_t RequestKvDemand(
+      const ScheduledRequest& request, std::size_t block_tokens) noexcept {
+    const auto shared =
+        std::min(request.prompt_tokens, request.shared_prefix_tokens);
+    const auto private_prompt = request.prompt_tokens - shared;
+    const auto generated = request.result.tokens.size();
+    const auto tokens = std::max(private_prompt + OutputReserveTokens(request),
+                                 private_prompt + generated);
+    return RoundKvTokens(tokens, block_tokens);
+  }
+
+  /// Total private KV the resident batch will hold. Snapshots restore into
+  /// the destination's own blocks, so a cached prefix still counts once per
+  /// resident. The sum is independent of the runner's free counter, which can
+  /// lag an asynchronous restore or a checkpoint frontier.
+  [[nodiscard]] static std::size_t ResidentKvDemand(
       const std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
       const std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
       const std::deque<std::shared_ptr<ScheduledRequest>>& capturing,
-      std::size_t block_tokens) const noexcept {
+      std::size_t block_tokens) noexcept {
     const std::array<const std::deque<std::shared_ptr<ScheduledRequest>>*, 3>
         lists{&prefilling, &decoding, &capturing};
     std::size_t total = 0;
@@ -853,23 +893,69 @@ struct TextGenerationScheduler::Impl {
       for (const auto& request : *list) {
         if (!request->runner_request)
           continue;
-        const std::size_t mapped = request->runner_request.prefill_position() +
-                                   request->result.tokens.size();
-        const std::size_t needed = AdmissionEstimateTokens(*request);
-        if (needed <= mapped)
-          continue;
-        std::size_t pending = needed - mapped;
-        if (block_tokens > 1) {
-          const auto remainder = pending % block_tokens;
-          if (remainder != 0)
-            pending += block_tokens - remainder;
-        }
-        if (pending > std::numeric_limits<std::size_t>::max() - total)
+        const auto demand = RequestKvDemand(*request, block_tokens);
+        if (demand > std::numeric_limits<std::size_t>::max() - total)
           return std::numeric_limits<std::size_t>::max();
-        total += pending;
+        total += demand;
       }
     }
     return total;
+  }
+
+  /// Resident KV that is already reflected in the pool's free count. A
+  /// request that has not run a step yet owns no rows; after its first step
+  /// the executor has mapped at least its complete prompt, so its full demand
+  /// is the safe upper bound. The output horizon is deliberately included:
+  /// it over-approximates mapped rows by at most that horizon.
+  [[nodiscard]] static std::size_t ResidentKvMapped(
+      const std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
+      const std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+      const std::deque<std::shared_ptr<ScheduledRequest>>& capturing,
+      std::size_t block_tokens) noexcept {
+    const std::array<const std::deque<std::shared_ptr<ScheduledRequest>>*, 3>
+        lists{&prefilling, &decoding, &capturing};
+    std::size_t total = 0;
+    for (const auto* list : lists) {
+      for (const auto& request : *list) {
+        if (!request->runner_request)
+          continue;
+        const bool executed = request->runner_request.prefill_position() != 0 ||
+                              !request->result.tokens.empty();
+        if (!executed)
+          continue;
+        total += RequestKvDemand(*request, block_tokens);
+      }
+    }
+    return total;
+  }
+
+  /// KV held outside the resident batch (retained rows, another consumer).
+  /// `resident_mapped` is what the free counter already charges to residents.
+  [[nodiscard]] static std::size_t ExternalKvUsage(
+      const SharedKvPoolTokens& pool, std::size_t resident_mapped) noexcept {
+    const auto used = pool.capacity > pool.free ? pool.capacity - pool.free : 0;
+    return used > resident_mapped ? used - resident_mapped : 0;
+  }
+
+  /// Checks a candidate that already holds a runner lease. Admission runs the
+  /// same demand check before Acquire; this second look catches a restored
+  /// prefix whose rows materialize during Acquire.
+  [[nodiscard]] bool ResidentKvFits(
+      const ScheduledRequest& candidate,
+      const std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
+      const std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+      const std::deque<std::shared_ptr<ScheduledRequest>>& capturing) const {
+    const auto pool = SharedKvPool();
+    if (!pool)
+      return true;
+    const auto block = std::max<std::size_t>(1, pool->block);
+    const auto demand =
+        ResidentKvDemand(prefilling, decoding, capturing, block);
+    const auto external = ExternalKvUsage(
+        *pool, ResidentKvMapped(prefilling, decoding, capturing, block));
+    const auto own = RequestKvDemand(candidate, block);
+    return demand <= pool->capacity && external <= pool->capacity - demand &&
+           own <= pool->capacity - demand - external;
   }
 
   [[nodiscard]] bool CanAdmitKv(
@@ -886,14 +972,14 @@ struct TextGenerationScheduler::Impl {
     // decode defers when the pool fills, so it still makes progress.
     if (prefilling.empty() && decoding.empty() && capturing.empty())
       return true;
-    const auto estimate = AdmissionEstimateTokens(request);
     const auto block = std::max<std::size_t>(1, pool->block);
-    const auto pending =
-        ResidentKvReservation(prefilling, decoding, capturing, block);
-    std::size_t needed = estimate;
-    if (const auto remainder = needed % block; remainder != 0)
-      needed += block - remainder;
-    return pool->free >= pending && pool->free - pending >= needed;
+    const auto demand =
+        ResidentKvDemand(prefilling, decoding, capturing, block);
+    const auto external = ExternalKvUsage(
+        *pool, ResidentKvMapped(prefilling, decoding, capturing, block));
+    const auto own = RequestKvDemand(request, block);
+    return demand <= pool->capacity && external <= pool->capacity - demand &&
+           own <= pool->capacity - demand - external;
   }
 
   /// Leaves the request queued and wakes admission after a short retry rather
@@ -934,6 +1020,41 @@ struct TextGenerationScheduler::Impl {
                      " retry_ms=" + std::to_string(kKvAdmissionRetry.count()));
   }
 
+  /// Parks a request whose cache restore materialized more KV than the
+  /// pre-admission check saw. It keeps its queue time and retries once
+  /// residents free blocks; starting it here would fill the pool and degrade
+  /// peers at the same frontier.
+  void DeferMaterializedKv(const std::shared_ptr<ScheduledRequest>& request) {
+    const auto retained = request->runner_request.Cancel();
+    request->runner_request = TextRunnerPool::Request{};
+    request->kv_deferrals += 1;
+    request->result.kv_deferrals = request->kv_deferrals;
+    request->advance_pending = false;
+    request->decode_due = false;
+    request->prefix_leader.reset();
+    request->prefix_considered = true;
+    request->shared_prefix_tokens = 0;
+    ReleaseProcessingSlot(request);
+    request->kv_retry_at = Clock::now() + std::chrono::milliseconds(20);
+    kv_deferred_requests.push_back(request);
+    detail::TotalKvDeferrals().fetch_add(1, std::memory_order_relaxed);
+    if (Logger::Enabled(LogLevel::kInfo)) {
+      std::size_t free = 0;
+      std::size_t own = 0;
+      if (const auto pool = SharedKvPool()) {
+        free = pool->free;
+        own = RequestKvDemand(*request, std::max<std::size_t>(1, pool->block));
+      }
+      Logger::Info(
+          "scheduler",
+          "event=kv_restore_deferred request=" + std::to_string(request->id) +
+              " free_tokens=" + std::to_string(free) + " own_tokens=" +
+              std::to_string(own) + " retained_snapshot_bytes=" +
+              std::to_string(retained.snapshot_bytes) +
+              " deferrals=" + std::to_string(request->kv_deferrals));
+    }
+  }
+
   /// Auto mode: one resident initially, then one more per scheduler turn while
   /// the queue has work and the KV estimate has room. With no resident or
   /// waiting request it returns to one without preempting live work.
@@ -949,13 +1070,12 @@ struct TextGenerationScheduler::Impl {
     const std::size_t resident =
         prefilling.size() + decoding.size() + capturing.size();
     std::size_t queued = 0;
-    std::size_t estimate = 0;
+    std::shared_ptr<ScheduledRequest> pending_request;
     {
       const std::lock_guard<std::mutex> lock(queue_mutex);
       queued = queued_count;
       if (!queued_clients.empty() && !queued_clients.front().requests.empty())
-        estimate =
-            AdmissionEstimateTokens(*queued_clients.front().requests.front());
+        pending_request = queued_clients.front().requests.front();
     }
     if (queued == 0 && waiting.empty() && kv_deferred_requests.empty()) {
       if (resident == 0 && current != 1) {
@@ -971,19 +1091,14 @@ struct TextGenerationScheduler::Impl {
       return;
     const std::array<const std::deque<std::shared_ptr<ScheduledRequest>>*, 3>
         resident_lists{&prefilling, &decoding, &capturing};
-    if (estimate != 0) {
-      if (const auto pool = SharedKvPool()) {
-        const auto block = std::max<std::size_t>(1, pool->block);
-        auto needed = estimate;
-        if (const auto remainder = needed % block; remainder != 0)
-          needed += block - remainder;
-        const auto pending =
-            ResidentKvReservation(prefilling, decoding, capturing, block);
-        if (pool->free < pending || pool->free - pending < needed)
+    if (pending_request) {
+      if (SharedKvPool()) {
+        if (!CanAdmitKv(*pending_request, prefilling, decoding, capturing))
           return;
       } else if (const auto free = FreeKvTokens(ResidentTokens(resident_lists),
                                                 decoding.size());
-                 free.has_value() && *free < estimate) {
+                 free.has_value() &&
+                 *free < AdmissionEstimateTokens(*pending_request)) {
         return;
       }
     }
@@ -995,10 +1110,13 @@ struct TextGenerationScheduler::Impl {
     const std::size_t next = std::min(capacity, std::max(current + 1, demand));
     SetBatchLimit(next);
     if (Logger::Enabled(LogLevel::kDebug)) {
-      Logger::Debug("scheduler",
-                    "event=auto_batch_limit value=" + std::to_string(next) +
-                        " queued=" + std::to_string(queued) +
-                        " estimate_tokens=" + std::to_string(estimate));
+      Logger::Debug(
+          "scheduler",
+          "event=auto_batch_limit value=" + std::to_string(next) +
+              " queued=" + std::to_string(queued) + " estimate_tokens=" +
+              std::to_string(pending_request
+                                 ? AdmissionEstimateTokens(*pending_request)
+                                 : 0));
     }
   }
 
@@ -1278,6 +1396,7 @@ struct TextGenerationScheduler::Impl {
     request->runner_request.Invalidate();
     request->runner_request = TextRunnerPool::Request{};
     request->prompt = std::move(replay);
+    request->prompt_tokens = request->prompt.size();
     request->preview_token.reset();
     request->preview_stops = false;
     request->advance_pending = false;
@@ -1285,6 +1404,7 @@ struct TextGenerationScheduler::Impl {
     request->prefix_leader.reset();
     // A replay owns no lease to share, so it must not park behind a peer.
     request->prefix_considered = true;
+    request->shared_prefix_tokens = 0;
     request->preemptions += 1;
     request->result.preemptions = request->preemptions;
     request->result.preempted_tokens += replayed;
@@ -1378,6 +1498,7 @@ struct TextGenerationScheduler::Impl {
       request->resume_sampler = request->runner_request.Sampler();
     }
     request->prompt = std::move(replay);
+    request->prompt_tokens = request->prompt.size();
     const auto retained = request->runner_request.Cancel();
     request->runner_request = TextRunnerPool::Request{};
     request->kv_deferrals += 1;
@@ -1390,6 +1511,7 @@ struct TextGenerationScheduler::Impl {
     request->preview_stops = false;
     request->prefix_leader.reset();
     request->prefix_considered = true;
+    request->shared_prefix_tokens = 0;
     ReleaseProcessingSlot(request);
     request->kv_retry_at = Clock::now() + std::chrono::milliseconds(20);
     kv_deferred_requests.push_back(request);
@@ -1876,12 +1998,15 @@ struct TextGenerationScheduler::Impl {
       if (!pool) {
         detail::KvPoolCapacityTokens().store(0, std::memory_order_relaxed);
         detail::KvPoolFreeTokens().store(0, std::memory_order_relaxed);
+        detail::KvPoolSharedBlocks().store(0, std::memory_order_relaxed);
         return;
       }
       detail::KvPoolCapacityTokens().store(pool->capacity,
                                            std::memory_order_relaxed);
       detail::KvPoolFreeTokens().store(pool->free, std::memory_order_relaxed);
       detail::KvPoolBlockTokens().store(pool->block, std::memory_order_relaxed);
+      detail::KvPoolSharedBlocks().store(pool->shared_blocks,
+                                         std::memory_order_relaxed);
     } catch (...) {
       // Pool gauges are best effort and must not fail scheduler work.
     }
@@ -1952,9 +2077,18 @@ struct TextGenerationScheduler::Impl {
       prompt += entry.prompt_tokens;
       generated += entry.generated_tokens;
     }
+    const auto queued =
+        std::max<std::int64_t>(
+            0, detail::RequestsDeferred().load(std::memory_order_relaxed)) +
+        std::max<std::int64_t>(
+            0, detail::RequestsWaiting().load(std::memory_order_relaxed));
+    const auto queued_max = std::max<std::uint64_t>(
+        stats_queue_max, static_cast<std::uint64_t>(queued));
+    detail::LastStatsQueueMax().store(queued_max, std::memory_order_relaxed);
     std::ostringstream out;
     out << "event=requests window_s=60 completed=" << window.size()
         << " failed=" << failed << " cancelled=" << cancelled
+        << " queued=" << queued << " queued_max=" << queued_max
         << " prompt_tokens=" << prompt << " generated_tokens=" << generated
         << " ids=";
     constexpr std::size_t kIdLimit = 24;
@@ -2058,6 +2192,11 @@ struct TextGenerationScheduler::Impl {
             : 0.0;
     const auto concurrency = std::max<std::int64_t>(
         0, detail::RequestsProcessing().load(std::memory_order_relaxed));
+    const auto queue =
+        std::max<std::int64_t>(
+            0, detail::RequestsDeferred().load(std::memory_order_relaxed)) +
+        std::max<std::int64_t>(
+            0, detail::RequestsWaiting().load(std::memory_order_relaxed));
     const auto pool_capacity =
         detail::KvPoolCapacityTokens().load(std::memory_order_relaxed);
     const auto pool_free =
@@ -2088,6 +2227,7 @@ struct TextGenerationScheduler::Impl {
                                              std::memory_order_relaxed);
     detail::LastStatsFailed().store(failed, std::memory_order_relaxed);
     detail::LastStatsCacheHits().store(cache_hits, std::memory_order_relaxed);
+    detail::LastStatsQueue().store(queue, std::memory_order_relaxed);
 
     if (!Logger::Enabled(LogLevel::kInfo))
       return;
@@ -2095,20 +2235,20 @@ struct TextGenerationScheduler::Impl {
       Logger::Info(
           "stats",
           "conc |  pp/s req  tg/s req  TTFT ms |  win pp/s  win tg/s    adm   "
-          "done  win s  ctx%  fail  cache");
+          "done  queue  win s  ctx%  fail  cache");
       Logger::Info("stats",
                    "-----------------------------------------------------------"
-                   "-----------------------------------------");
+                   "--------------------------------------------");
     }
     std::ostringstream out;
     out << std::fixed << std::setprecision(1) << std::setw(4) << concurrency
         << " | " << std::setw(9) << pp_request << std::setw(9) << tg_request
         << std::setw(9) << std::setprecision(0) << ttft << " | " << std::setw(9)
         << std::setprecision(1) << total_pp << std::setw(9) << total_tg
-        << std::setw(7) << admitted << std::setw(7) << finished << std::setw(7)
-        << std::setprecision(2) << interval << std::setw(6)
-        << std::setprecision(1) << context_used_percent << std::setw(5)
-        << failed << std::setw(6) << cache_hits;
+        << std::setw(7) << admitted << std::setw(7) << finished << std::setw(6)
+        << queue << std::setw(7) << std::setprecision(2) << interval
+        << std::setw(6) << std::setprecision(1) << context_used_percent
+        << std::setw(5) << failed << std::setw(6) << cache_hits;
     Logger::Info("stats", out.str());
   }
 
@@ -2124,8 +2264,16 @@ struct TextGenerationScheduler::Impl {
       if (stop_token.stop_requested())
         break;
       const auto now = clock::now();
+      const auto queue_now =
+          std::max<std::int64_t>(
+              0, detail::RequestsDeferred().load(std::memory_order_relaxed)) +
+          std::max<std::int64_t>(
+              0, detail::RequestsWaiting().load(std::memory_order_relaxed));
+      stats_queue_max = std::max<std::uint64_t>(
+          stats_queue_max, static_cast<std::uint64_t>(queue_now));
       if (now - last_window >= std::chrono::seconds(60)) {
         LogCompletedWindow();
+        stats_queue_max = 0;
         stats_header_due = true;
         last_window = now;
       }
@@ -2170,7 +2318,7 @@ struct TextGenerationScheduler::Impl {
           residents,
       std::size_t waiting) {
     if (std::exchange(request->prefix_considered, true) ||
-        !request->cache_prompt ||
+        !request->cache_prompt || !runner_pool->PrefixCacheEnabled() ||
         // Parked requests hold no runner lease; bound their reservations like
         // admitted ones.
         waiting + 1 >= EffectiveCapacity())
@@ -2221,6 +2369,7 @@ struct TextGenerationScheduler::Impl {
       return false;
     request->prefix_leader = std::move(leader);
     request->prefix_position = position;
+    request->shared_prefix_tokens = position;
     request->prefix_wait_start = Clock::now();
     if (Logger::Enabled(LogLevel::kDebug)) {
       std::ostringstream line;
@@ -2307,6 +2456,17 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
+  [[nodiscard]] static std::shared_ptr<ScheduledRequest> PeekReleased(
+      const std::deque<std::shared_ptr<ScheduledRequest>>& waiting) {
+    const auto released =
+        std::ranges::find_if(waiting, [](const auto& request) {
+          return request->prefix_leader == nullptr &&
+                 !request->publication_waiting;
+        });
+    return released == waiting.end() ? std::shared_ptr<ScheduledRequest>{}
+                                     : *released;
+  }
+
   [[nodiscard]] static std::shared_ptr<ScheduledRequest> PopReleased(
       std::deque<std::shared_ptr<ScheduledRequest>>& waiting) {
     const auto released =
@@ -2335,9 +2495,23 @@ struct TextGenerationScheduler::Impl {
            prefilling.size() + decoding.size() + capturing.size() <
                EffectiveCapacity()) {
       // A preempted request owns the next free session: its replay is the
-      // work an older arrival already paid for.
-      auto request = PopPreempted(preempted);
-      if (request == nullptr) {
+      // work an older arrival already paid for. Replays are admitted through
+      // the same KV check as new arrivals: a degraded request whose full
+      // history no longer fits beside the residents must wait for room
+      // instead of mapping blocks another resident reserved.
+      std::shared_ptr<ScheduledRequest> request;
+      if (!preempted.empty()) {
+        if (!CanAdmitKv(*preempted.front(), prefilling, decoding, capturing)) {
+          DeferAdmission(preempted.front(), prefilling, decoding, capturing);
+          return;
+        }
+        request = PopPreempted(preempted);
+      } else if (const auto released = PeekReleased(waiting);
+                 released != nullptr) {
+        if (!CanAdmitKv(*released, prefilling, decoding, capturing)) {
+          DeferAdmission(released, prefilling, decoding, capturing);
+          return;
+        }
         request = PopReleased(waiting);
       }
       if (request == nullptr) {
@@ -2349,6 +2523,21 @@ struct TextGenerationScheduler::Impl {
             EffectiveCapacity())
           return;
         const auto next = PeekQueued();
+        // Park a follower before charging its full prompt. A shared-prefix
+        // wait holds no lease and maps no rows; once the leader publishes the
+        // checkpoint, admission budgets only the private tail. Checking the
+        // full prompt first would cap a burst at the number of whole prompts
+        // that fit, even though the prefix is shared.
+        if (next && !next->prefix_considered &&
+            WaitForSharedPrefix(next, residents, waiting.size())) {
+          request = PopQueued();
+          if (request) {
+            waiting.push_back(std::move(request));
+            kv_admission_retry_at.reset();
+            continue;
+          }
+          return;
+        }
         if (next && !CanAdmitKv(*next, prefilling, decoding, capturing)) {
           DeferAdmission(next, prefilling, decoding, capturing);
           return;
@@ -2439,6 +2628,21 @@ struct TextGenerationScheduler::Impl {
           CompleteCancelled(request);
           continue;
         }
+        // A planned live-prefix share is only a discount if Acquire actually
+        // restored it. A cold or shorter restore keeps the full prompt budget.
+        if (request->shared_prefix_tokens != 0 &&
+            request->runner_request.prefill_position() <
+                request->shared_prefix_tokens)
+          request->shared_prefix_tokens = 0;
+        // Acquire may restore a cached prefix and materialize its KV rows
+        // after the pre-admission check ran. Re-check with the lease in hand:
+        // if this request plus the residents' output reserves no longer fit,
+        // park it now instead of filling the pool and degrading every peer.
+        if (!(prefilling.empty() && decoding.empty() && capturing.empty()) &&
+            !ResidentKvFits(*request, prefilling, decoding, capturing)) {
+          DeferMaterializedKv(request);
+          continue;
+        }
 
         request->result.component_cache =
             request->runner_request.component_cache_metrics();
@@ -2468,6 +2672,27 @@ struct TextGenerationScheduler::Impl {
                                          .count();
           request->result.resident_requests_at_admission =
               prefilling.size() + decoding.size() + capturing.size() + 1;
+        }
+        if (Logger::Enabled(LogLevel::kDebug)) {
+          const auto block = [&] {
+            const auto pool = SharedKvPool();
+            return pool ? std::max<std::size_t>(1, pool->block)
+                        : std::size_t{1};
+          }();
+          const auto demand =
+              ResidentKvDemand(prefilling, decoding, capturing, block) +
+              RequestKvDemand(*request, block);
+          std::size_t capacity = 0;
+          if (const auto pool = SharedKvPool())
+            capacity = pool->capacity;
+          Logger::Debug(
+              "scheduler",
+              "event=kv_admitted request=" + std::to_string(request->id) +
+                  " demand_tokens=" + std::to_string(demand) +
+                  " capacity_tokens=" + std::to_string(capacity) +
+                  " resident=" +
+                  std::to_string(prefilling.size() + decoding.size() +
+                                 capturing.size() + 1));
         }
         PublishAdmission(request);
         PublishPromptProgress(request);
@@ -2508,6 +2733,7 @@ struct TextGenerationScheduler::Impl {
           request->result.kv_deferrals = request->kv_deferrals;
           request->prefix_leader.reset();
           request->prefix_considered = true;
+          request->shared_prefix_tokens = 0;
           ReleaseProcessingSlot(request);
           request->kv_retry_at = now + std::chrono::milliseconds(20);
           if (Logger::Enabled(LogLevel::kInfo)) {
@@ -2612,6 +2838,14 @@ struct TextGenerationScheduler::Impl {
             }
           }
         }
+      }
+      // `budget` is the whole iteration's KV budget, but PrefillBatch applies
+      // max_input_tokens per item. Split it across the cohort so a pass of N
+      // prompts cannot map N times the free pool in one step; without this a
+      // burst of long prompts overran the pool and every peer degraded at the
+      // same frontier.
+      if (!peers.empty()) {
+        budget = std::max<std::size_t>(1, budget / (peers.size() + 1));
       }
       request->result.prefill_budget_tokens = budget;
       for (const auto& peer : peers) {
@@ -3372,6 +3606,10 @@ struct TextGenerationScheduler::Impl {
       if (device_lost.load(std::memory_order_acquire))
         break;
       UpdateKvPoolGauges();
+      detail::RequestsWaiting().store(
+          static_cast<std::int64_t>(
+              waiting.size() + kv_deferred_requests.size() + preempted.size()),
+          std::memory_order_relaxed);
       loop_working.store(true, std::memory_order_relaxed);
       ProcessQueuedCancellations();
       ProcessCoalescedFollowers(prefilling, decoding, capturing);
@@ -3446,6 +3684,11 @@ struct TextGenerationScheduler::Impl {
         };
         if (capturing.empty() && waiting.empty() &&
             kv_deferred_requests.empty()) {
+          // Refresh once on the transition to idle: the 1 s throttle can
+          // otherwise leave /metrics with the pre-release pool value while
+          // no work runs.
+          last_kv_gauge_update = {};
+          UpdateKvPoolGauges();
           // Only the idle wait has a timer. Arrival interrupts it immediately;
           // no clock checks or device polling are added to active work units.
           while (!wake()) {
@@ -3662,6 +3905,7 @@ struct TextGenerationScheduler::Impl {
   // requests; stats_monitor snapshots once per 10 s and once per minute.
   mutable std::mutex stats_mutex;
   std::deque<CompletedStats> stats_window;
+  std::uint64_t stats_queue_max{0};
   std::uint64_t stats_admitted{0};
   std::uint64_t stats_prompt_tokens{0};
   std::uint64_t stats_generated_tokens{0};
@@ -3913,6 +4157,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->id = impl_->next_request_id.fetch_add(1, std::memory_order_relaxed);
   request->client_id =
       metadata.client_id.empty() ? "anonymous" : std::move(metadata.client_id);
+  request->prompt_tokens = prompt.size();
   request->result.prompt_tokens = prompt.size();
   request->result.token_metrics_recorded = true;
   request->result.client_id = request->client_id;

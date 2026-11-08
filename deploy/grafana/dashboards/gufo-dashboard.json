@@ -945,7 +945,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 40
       },
       "id": 11,
       "options": {
@@ -1057,7 +1057,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 40
       },
       "id": 12,
       "options": {
@@ -1132,7 +1132,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 40
+        "y": 48
       },
       "id": 13,
       "options": {
@@ -1224,7 +1224,7 @@
         "h": 6,
         "w": 18,
         "x": 6,
-        "y": 40
+        "y": 48
       },
       "id": 14,
       "options": {
@@ -1265,6 +1265,72 @@
       ],
       "title": "Latest request speeds",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gufo-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      },
+      "id": 15,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gufo-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "gufo_kv_pool_shared_blocks",
+          "legendFormat": "shared blocks",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "KV shared prefix blocks",
+      "type": "stat"
     }
   ],
   "refresh": "10s",

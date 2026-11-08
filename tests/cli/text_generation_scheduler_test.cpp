@@ -44,6 +44,7 @@ using gufo::server::TextGenerationError;
 using gufo::server::TextGenerationErrorCode;
 using gufo::server::TextGenerationScheduler;
 using gufo::server::TextModelRunner;
+using gufo::server::TextPrefillBatchItem;
 using gufo::server::TextPrefillPolicy;
 using gufo::server::TextPrefillStep;
 using gufo::server::TextRequestMetadata;
@@ -207,6 +208,9 @@ struct FakeControl {
   std::atomic<std::int64_t> first_request_advance_ns{0};
   bool incremental_prefill{true};
   std::size_t prefill_capacity{std::numeric_limits<std::size_t>::max()};
+  bool supports_prefill_batch{false};
+  /// (cohort size, largest max_input_tokens) of every batched prefill pass.
+  std::vector<std::pair<std::size_t, std::size_t>> prefill_batches;
   bool supports_batched_advance{false};
   bool final_token_advance_required{true};
   bool incremental_text_is_exact{false};
@@ -389,6 +393,22 @@ public:
   void PrepareBatchExecution(TextRunnerState& state) const override {
     (void)RequireFakeState(state);
     control_->batch_preparations.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] bool SupportsPrefillBatch() const override {
+    return control_->supports_prefill_batch;
+  }
+
+  [[nodiscard]] std::vector<TextPrefillStep> PrefillBatch(
+      std::span<const TextPrefillBatchItem> items) const override {
+    std::size_t widest = 0;
+    for (const auto& item : items)
+      widest = std::max(widest, item.max_input_tokens);
+    {
+      const std::lock_guard<std::mutex> lock(control_->mutex);
+      control_->prefill_batches.emplace_back(items.size(), widest);
+    }
+    return TextModelRunner::PrefillBatch(items);
   }
 
   [[nodiscard]] TextPrefillStep Prefill(
@@ -3368,6 +3388,93 @@ void TestAutoSessionsAdmitOnlyWhatFitsSharedKv() {
          "shared-KV admission leaves no request behind");
 }
 
+// A batched prefill pass shares one KV budget across its cohort. Giving each
+// peer the whole free-pool count mapped several times the free blocks in one
+// step; the following KV exhaustion then replayed every peer from the same
+// frontier, which is what turned a burst into a livelock.
+void TestBatchedPrefillSharesKvBudget() {
+  auto control = std::make_shared<FakeControl>();
+  control->supports_prefill_batch = true;
+  control->shared_kv = true;
+  control->shared_kv_capacity_tokens = 65536;
+  control->shared_kv_free_tokens.store(65536);
+  control->shared_kv_block_tokens = 1;
+  control->prefill_capacity = 512;
+  control->block_prefill_label = 1;
+  control->max_context = 8192;
+  auto scheduler = MakeScheduler(control, 6);
+
+  auto first =
+      scheduler->Submit(std::vector<TextRunnerToken>(4000, 1), 2, 0.0F);
+  control->WaitForPrefill(1);
+  std::vector<TextGenerationScheduler::Request> peers;
+  for (TextRunnerToken label = 2; label <= 6; ++label) {
+    peers.push_back(
+        scheduler->Submit(std::vector<TextRunnerToken>(4000, label), 2, 0.0F));
+  }
+  control->ReleasePrefill();
+  const auto first_result = first.Wait();
+  Expect(!first_result.cancelled, "the lead of a batched prefill completes");
+  for (auto& peer : peers) {
+    Expect(!peer.Wait().cancelled, "a batched prefill peer completes");
+  }
+
+  std::vector<std::pair<std::size_t, std::size_t>> batches;
+  {
+    const std::lock_guard<std::mutex> lock(control->mutex);
+    batches = control->prefill_batches;
+  }
+  Expect(!batches.empty(), "the runner observed a batched prefill");
+  Expect(std::ranges::any_of(batches,
+                             [](const auto& entry) { return entry.first > 1; }),
+         "a multi-item prefill pass ran so the budget is shared");
+  for (const auto& [cohort, widest] : batches) {
+    const std::size_t share =
+        gufo::server::kDefaultDecodeActivePrefillTokens / cohort;
+    Expect(widest <= share,
+           "a cohort item receives at most its share of the prefill budget: "
+           "cohort=" +
+               std::to_string(cohort) + " widest=" + std::to_string(widest) +
+               " share=" + std::to_string(share));
+  }
+}
+
+// Admission must keep budgeting the prompt after Acquire moves the token
+// vector into the runner lease. The moved-from prompt used to reserve only
+// the output horizon, so a burst overcommitted the shared pool, filled it
+// with prefixes, and then degraded every request at the same frontier.
+void TestAdmissionKeepsPromptAfterLeaseMove() {
+  namespace metrics = gufo::server::detail;
+  auto control = std::make_shared<FakeControl>();
+  control->shared_kv = true;
+  control->shared_kv_capacity_tokens = 400;
+  control->shared_kv_free_tokens.store(400);
+  control->shared_kv_block_tokens = 1;
+  control->block_prefill_label = 1;
+  control->max_context = 512;
+  auto scheduler = MakeScheduler(control, 2);
+
+  const auto processing_before = metrics::RequestsProcessing().load();
+  auto first =
+      scheduler->Submit(std::vector<TextRunnerToken>(200, 1), 10, 0.0F);
+  control->WaitForPrefill(1);
+  auto second =
+      scheduler->Submit(std::vector<TextRunnerToken>(200, 2), 10, 0.0F);
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  Expect(metrics::RequestsDeferred().load() >= 1,
+         "the second request stays queued while the first prompt is resident");
+  Expect(metrics::RequestsProcessing().load() == processing_before + 1,
+         "only the resident prompt holds a processing slot");
+
+  control->ReleasePrefill();
+  const auto first_result = first.Wait();
+  const auto second_result = second.Wait();
+  Expect(!first_result.cancelled && !second_result.cancelled,
+         "both requests complete once the resident prompt is released");
+  Expect(second_result.queue_ms >= 0.0,
+         "the queued request keeps a queue timestamp");
+}
+
 // TP-P1: the bound is a real scheduling input, not a hint.
 void TestMaxNumSeqsBoundsAreValidated() {
   auto control = std::make_shared<FakeControl>();
@@ -3721,6 +3828,8 @@ int main() {
   TestAutoSessionsGrowWithDemandAndReturnToIdle();
   TestAutoSessionsDeferKvExhaustionWithoutResident();
   TestAutoSessionsAdmitOnlyWhatFitsSharedKv();
+  TestBatchedPrefillSharesKvBudget();
+  TestAdmissionKeepsPromptAfterLeaseMove();
   TestMaxNumSeqsBoundsAreValidated();
   TestPendingLimitsRejectBeforeStateAdmission();
   TestPendingClientsAreRoundRobinAndIndividuallyBounded();

@@ -57,15 +57,18 @@ queries.
 | Token throughput | `sum(rate(gufo_prompt_tokens_total...))`, `sum(rate(gufo_tokens_generated_total...))` | Prompt and generated tokens per second. |
 | Requests | `gufo_requests_processing`, `gufo_requests_deferred` | In-flight and waiting requests. |
 | Session utilization | `gufo_sessions_active / gufo_sessions_capacity` | Fraction of session slots busy. |
-| Prefix cache hit rate | `gufo_prefix_cache_hit_rate` | Cached prompt tokens over all prompt tokens. |
-| KV cache usage | `gufo_kv_cache_usage_ratio` | Live context occupancy over capacity. |
+| Prefix cache hit rate | `gufo_prefix_cache_hit_rate` | Cached prompt tokens over all prompt tokens; zero when `--cache-ram-bytes off`. |
+| KV cache usage | `gufo_kv_cache_usage_ratio` | Shared paged-KV pool used over capacity; matches the log's `ctx%`. |
+| KV shared prefix blocks | `gufo_kv_pool_shared_blocks` | On Flash-Next, live prefix blocks referenced by multiple requests (COW sharing). |
 | KV pressure | `gufo_kv_limited_total`, `gufo_kv_deferred_total`, `gufo_preemptions_total` rates | How often KV capacity shapes or interrupts work. |
 | Memory | `gufo_process_resident_memory_bytes`, `gufo_host_available_memory_bytes` | Process RSS and host headroom in bytes. |
 | Device lost | `gufo_device_lost_total` | Confirmed GPU context losses; any value above zero is critical. |
 | Latest request speeds | `gufo_prompt_tokens_per_second`, `gufo_tokens_per_second` | Last completed request's prompt and decode speed. |
 
 All panel queries reference only names the text server emits. The dashboard
-does not use recording rules.
+does not use recording rules or assume a session count; the current deployment
+(40 sessions, 17 GiB pool) is reported by the runtime gauges
+`gufo_sessions_capacity` and `gufo_kv_pool_capacity_tokens`.
 
 ## Provision the dashboard
 

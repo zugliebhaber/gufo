@@ -16,7 +16,8 @@ inference and is not configurable.
 **Across requests.** Keeping that state alive after a response finishes, so
 the next turn of the same conversation does not recompute the prefix it shares
 with the previous one. This is what the rest of this document is about: the
-`ContinuationCache`, and the optional on-disk tier behind `--cache-disk`.
+component cache for Qwen3.8-27B/Flash-Next, the legacy `ContinuationCache` for
+DeepSeek, and the optional on-disk tier behind `--cache-disk`.
 
 The second is where the important subtlety lives. What Gufo retains is **not**
 literally K/V tensors. It is an opaque snapshot owned by the model runner. For
@@ -83,7 +84,14 @@ a prefix.
 ## Finding reuse
 
 A request arrives with a token sequence. The cache looks for the longest
-retained prefix of it, in two different forms.
+retained prefix of it, in two different forms. On the component-cache path used
+by Qwen3.8-27B and Flash-Next, both forms sit in a radix-style compressed
+token-prefix tree, one per compatibility identity: tree edges hold tokens,
+records point at live frontiers, RAM checkpoints or durable descriptions, and
+the KV rows themselves stay in the refcounted block pool. This is
+RadixAttention-style prefix reuse extended with hybrid recurrent/indexer/MTP
+boundaries and the disk tier. DeepSeek keeps the legacy bounded exact-prefix
+snapshot cache described below.
 
 ```mermaid
 flowchart TD
@@ -107,7 +115,9 @@ recently used idle session (Flash-Next prefers one without a frontier), so
 it does not replace the frontier of a conversation that has just replied.
 
 A **snapshot** is an immutable retained checkpoint. Reusing one means restoring
-it into a session, which costs a copy.
+it into a session: private state is always copied, while Flash-Next can adopt
+full KV blocks by reference and copies only a partial tail; Qwen3.8-27B copies
+the KV rows.
 
 Both require an **exact prefix match**. The cache still computes the longest
 common prefix on a miss and reports it, which is why a miss can say "we agreed
@@ -196,6 +206,23 @@ prompt, four concurrent requests took 13.4 s with each prefilling 3.9k tokens.
 Prefilling the shared prefix once and restoring it took 4.6 s, each request
 then prefilling 115 tokens **(measured)**. With a 242-token shared prefix the
 gain was about 1 s of 9 s, which is why short prefixes do not wait.
+
+On Flash-Next the follower does not copy the shared rows. `BorrowRowsView`
+lends the leader's full 128-token blocks, `CopyRowsIn`/`AdoptSharedRows`
+adopts them by refcount, and only the partial tail block is copied. The
+scheduler charges the shared prefix once: a parked follower reserves only its
+private tail plus the output horizon. `gufo_kv_pool_shared_blocks` reports the
+live shared blocks. A 64-session pool with a burst of 64 requests over a
+9.735-token prefix peaked at **22 %** of a 250k pool and completed without KV
+degradations. The current deployment caps sessions at 40 and uses a 17 GiB
+pool: 40 requests over that prefix ran 40/40 at **3.4 %** of the pool; 43 short
+requests ran 40 active and 3 waiting. A 26k prompt plus the 4k horizon admits
+about 24 long requests. Before live lending each request mapped its own copy
+of the prefix. Completed
+frontiers are still written to the host when the device pool cannot cover the
+configured decode cohort's full contexts (up to eight), so a finished request
+cannot pin the pool; their retained host checkpoints are evicted by the prefix
+index's retention policy.
 
 ## What gets retained
 
@@ -635,7 +662,8 @@ Reading them:
   zero and prefills the prefix; the others wait, then report the prefix in
   `cache_n` and only their own tail in `prompt_n`. With `--log-level debug`,
   `event=shared_prefix_wait` and `event=shared_prefix_ready` name the leader
-  and position.
+  and position. On Flash-Next, `gufo_kv_pool_shared_blocks` rises while the
+  followers adopt those blocks and returns to zero after the burst.
 - `cache_n` **pinned** at the same value while `prompt_n` grows every turn is a
   checkpoint that stopped advancing. See #335.
 - A large `cache_common_prefix_tokens` on a miss means a long prefix agreed and

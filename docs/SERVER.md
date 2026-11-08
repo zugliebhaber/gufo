@@ -137,20 +137,61 @@ state_capacity_bytes=... shared_kv_tokens=...` and repeated in
 `load_completed` as `sessions=auto(N)`. Autoscaling is hard-capped at **64
 sessions**; `GUFO_AUTO_SESSIONS_MAX=N` may lower that ceiling but never raise
 it. On this 128 GiB Strix Halo the uncapped base-state fit is **150 sessions
-at 128k** and **96 at 250k**, so the effective auto pool is 64 and the hybrid
-plan uses at most 64 rows.
+at 128k** and **96 at 250k**, so the product-default auto pool is 64 and the
+hybrid plan uses at most 64 rows. This deployment lowers the cap to 40, so its
+plans use at most 40 rows.
+
+**Current deployment profile (2026-11-08).** This host lowers the cap with
+`GUFO_AUTO_SESSIONS_MAX=40` and runs `--sessions auto --context 250000`, a
+**17 GiB** KV pool (`--kv-pool-bytes 18253611008`, 742,656 tokens) and a
+**2 GiB** RAM cache (`--cache-ram-bytes 2147483648`). The 40 states cost
+`40 x 303.75 MB ~= 12.2 GB` and leave about **8 GB host memory** available.
+Short requests can fill all 40 sessions; 43 short requests run 40 active and 3
+waiting. A 26k prompt plus the 4k output horizon costs ~30k tokens, so the
+17 GiB pool admits about **24** long requests; 43 long requests run 24 active
+and 19 waiting. The 96/150 figures above are uncapped historical fits; the
+64-session hard cap remains the product limit.
 
 The scheduler starts with one resident session and grows toward visible demand
-while the shared KV pool has room. The admission estimate for a request is its
-prompt length plus its requested output budget; an unlimited request reserves a
-conservative 512-token short-chat budget instead of the whole remaining context.
-The estimate is compared against the pool's free blocks plus the reservations
-of requests that are admitted but not yet mapped. If it does not fit, the
-request stays queued and admission retries after 20 ms; the oldest request may
-still start when nothing else is resident so one long prompt cannot deadlock.
-When the queue drains, the resident bound returns to one without preempting
-live work. A single-user server therefore stays at one session and only pays
-for concurrency while requests are actually waiting.
+while the shared KV pool has room. Admission budgets each request's **complete
+private prompt** plus a bounded output horizon: **4096 tokens** for an explicit
+`max_tokens`, or a 512-token short-chat budget for an unlimited request. A live
+shared prefix is charged once; each follower reserves only its private tail. The
+prompt size is kept separately from the token vector, which moves into the
+runner lease at admission; a moved-from prompt must never shrink the budget.
+The full client output limit is deliberately not reserved up front, but the
+resident sum — not the pool's lagging free counter — is checked against the
+pool capacity. A checkpoint frontier can sit at 4k tokens while the executor
+has already mapped the whole 30k prompt, and a cache restore can materialize
+rows after `Acquire`; the demand check therefore uses the complete private
+prompt (the shared prefix counted once) and the generated history, independent
+of `prefill_position`.
+
+If the request does not fit, it stays queued and admission retries after
+20 ms; the oldest request may still start when nothing else is resident so one
+long prompt cannot deadlock. When the queue drains, the resident bound returns
+to one without preempting live work. A single-user server therefore stays at
+one session and only pays for concurrency while requests are actually waiting.
+
+`--cache-ram-bytes off` disables cross-request prefix sharing as well as RAM
+checkpoints: without a retention budget a shared checkpoint would pin device
+KV rows it cannot account for, so each request prefills independently and the
+prefix-cache hit columns stay at zero. Enable the RAM cache (`--cache-ram-bytes`
+at auto, or an explicit byte budget) for shared-prefix waits and non-zero
+prefix hit rates.
+
+With caching enabled, a follower waits for its leader's checkpoint and then
+**adopts the leader's full prefix blocks by refcount** instead of copying the
+rows; only the partial tail block is copied. Admission charges the shared
+prefix once: a parked follower reserves only its private tail plus the output
+horizon. `gufo_kv_pool_shared_blocks` reports the live shared blocks. On a
+64-session pool, a burst of 64 requests sharing a 9.735-token prefix peaked
+near **22 %** of a 250k pool and completed without degradations; the same burst
+needed one private prompt copy per request before this change. The current
+40-session/17 GiB profile runs 40 such requests at **3.4 %** of the pool and
+queues the rest at the session cap. Completed frontiers are still written to
+the host when the pool cannot cover the decode cohort's full contexts (up to
+eight), so a small pool cannot be pinned by finished requests.
 
 Auto mode also changes failure handling. A request that cannot get device KV
 blocks is deferred and retried instead of being failed. The scheduler ignores
@@ -162,11 +203,17 @@ does not abort a request while it is deferred for KV. `--max-pending` still
 bounds the admission queue; auto mode does not turn queue-full admission into
 unlimited waiting.
 
-Because the final session count is resolved after model load, auto-mode servers
-disable device-row lending for prefix-cache checkpoints. A completed request
-keeps its checkpoint rows on the host instead of pinning pool blocks, so a cache
-checkpoint cannot starve requests that are still waiting to prefill.
-Fixed-session servers keep lending enabled.
+Device-row lending has two levels. On Flash-Next, a **live prefix borrow** is
+always allowed when the pool covers one context: the source already owns those
+blocks and a follower adopts them by refcount, so no new device rows are
+allocated. Keeping
+a **completed frontier** on the device is stricter: it requires headroom for the
+configured decode cohort (up to eight full contexts). A 250k auto pool (one
+context) therefore
+swaps completed prefix rows to the host instead of pinning the pool, while
+live concurrent sharing stays active. `gufo_kv_pool_shared_blocks` reports the
+live shared blocks; completed host snapshots are evicted by the prefix index's
+retention policy.
 
 Auto mode applies to text LLM serving. Embeddings, image, TTS, ASR and video
 servers keep their own fixed queues and do not accept `--sessions auto`.
@@ -174,11 +221,12 @@ servers keep their own fixed queues and do not accept `--sessions auto`.
 The 2026-11-05 build, which still sized by full context, resolved 12 sessions
 at 128k; its bounded sweep is retained in [the Flash-Next auto-session
 benchmark](models/qwen3.8-flash-next/BENCHMARKS.md#auto-sessions-at-128k-2026-11-05).
-With base-state sizing, the uncapped fit at 250k is 96 sessions: 100 prompts of
-about 3,000 tokens (306,093 prompt tokens total) all completed with HTTP 200 in
-238.6 s, while the shared pool's high-water mark stayed at 1,675 of 1,954
-blocks instead of being oversubscribed. Current builds cap autoscaling at 64
-sessions.
+The 2026-11-06 build introduced base-state sizing; its uncapped fit at 250k was
+96 sessions: 100 prompts of about 3,000 tokens (306,093 prompt tokens total)
+all completed with HTTP 200 in 238.6 s, while the shared pool's high-water mark
+stayed at 1,675 of 1,954 blocks instead of being oversubscribed. Current builds
+cap autoscaling at 64 sessions; this deployment lowers it to 40 and uses the
+profile above.
 
 The batch width is a per-model capability. Qwen3.8 Flash-Next advertises
 batched plans from two to **256 rows**. Auto sessions fill the decode cohort up
@@ -1604,8 +1652,9 @@ prompt-lookup copies (`gufo_spec_lookup_tokens_total`,
 even if the client disconnects before reading it; requests that fail in the
 scheduler, such as on a deadline or a runner error, add none of the token or
 cache counters but still increment `gufo_requests_total{status="failed"}`.
-`llamacpp:kv_cache_usage_ratio` is the in-flight prompt and generated tokens
-over sessions times context; retained cache entries are not counted.
+`llamacpp:kv_cache_usage_ratio` is the shared paged-KV pool's used tokens over
+capacity. It matches `gufo_kv_pool_used_ratio`, `gufo_kv_cache_usage_ratio` and
+the log's `ctx%`; it is not the old session-count-times-context estimate.
 
 The Prometheus-native `gufo_*` families mirror those values and add request
 outcomes and latency. `gufo_requests_total{status="completed|cancelled|failed"}`
@@ -1616,10 +1665,17 @@ requests, from submission to first and last generated token.
 `gufo_sessions_capacity`, `gufo_sessions_active` and `gufo_context_tokens`
 describe the session pool, and `gufo_process_resident_memory_bytes` and
 `gufo_host_available_memory_bytes` report process and unified-memory headroom.
-`gufo_requests_admitted_total` counts accepted requests. `gufo_kv_pool_*`
-reports actual shared-KV-pool capacity, free/used tokens and utilization;
-`gufo_stats_*` gauges mirror every numeric field of the latest 10 s log row.
-The `llamacpp:*` families remain for llama.cpp-compatible tooling.
+`gufo_requests_admitted_total` counts accepted requests.
+`gufo_requests_deferred` is the pending-queue depth, `gufo_requests_waiting`
+counts parked shared-prefix/KV-retry/preemption requests, and
+`gufo_requests_queued` is their sum; `gufo_stats_queue` mirrors the latest log
+row's `queue` column and `gufo_stats_queue_max` the last minute's
+`queued_max`. `gufo_kv_pool_*` reports actual shared-KV-pool capacity,
+free/used tokens and utilization; `gufo_kv_pool_shared_blocks` counts live
+blocks referenced by multiple requests (prefix COW). `gufo_stats_*` gauges
+mirror every numeric
+field of the latest 10 s log row. The `llamacpp:*` families remain for
+llama.cpp-compatible tooling.
 `Server-Timing`, generation `timings`, and Chat Completions `usage.gufo`
 provide request-level measurements.
 
@@ -1676,19 +1732,24 @@ level.
 
 Text inference no longer writes one INFO line per request. At INFO it emits a
 **10 s interval table** (`conc | pp/s req tg/s req TTFT ms | win pp/s win
-tg/s adm done win s ctx% fail cache`) and a **once-per-minute completed-request
-line** listing the request IDs with `ok`, `cancel` or `fail`. Every numeric
-table column is the difference between two consecutive snapshots: an idle row
-therefore reports zeros instead of the lifetime average. The `win` columns are
-the aggregate prompt and generated token throughput over that interval;
-`adm` is the number of requests newly accepted by the scheduler, including
-requests that wait in the pending queue; `done` is the number of finished
-requests, including cancelled and failed ones; `win s` is the interval
-duration; `ctx%` is the used shared KV-pool memory over its capacity; `fail`
+tg/s adm done queue win s ctx% fail cache`) and a **once-per-minute
+completed-request line** listing the request IDs with `ok`, `cancel` or
+`fail`; that line also reports `queued` at the snapshot and `queued_max` over
+the window. Every numeric table column is the difference between two
+consecutive snapshots: an idle row therefore reports zeros instead of the
+lifetime average. The `win` columns are the aggregate prompt and generated
+token throughput over that interval; `adm` is the number of requests newly
+accepted by the scheduler, including requests that wait in the pending queue;
+`done` is the number of finished requests, including cancelled and failed
+ones; `queue` is the current total waiting depth (pending queue plus requests
+parked for shared prefix, KV retry or preemption replay); `win s` is the
+interval duration; `ctx%` is the used shared KV-pool memory over its capacity;
+`fail`
 and `cache` count failures and prefix-cache hits in the interval. `conc`
 remains the live count of requests currently being processed, so a row can
-have `conc > 0` while `done = 0` and `adm = 0` when admitted requests are still
-running. The table header is printed only after a minute request line, so the
+have `conc > 0` while `done = 0`, `adm = 0` and `queue = 0` when admitted
+requests are still running. The table header is printed only after a minute
+request line, so the
 10 s rows between minute boundaries carry data without repeating the header.
 Routine scheduler and cache detail stays at DEBUG: batch-limit changes,
 batched prefill widths, cache acquire/retention events and per-request

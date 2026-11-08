@@ -20,6 +20,14 @@ für Feature, Phase 1 zuerst.
 - **Hardware-Verdikt:** `build/release/gufo diagnose` meldet `Overall Status
   [PASS]`, `gfx1151, 20 CUs`, 125 GiB Unified Memory, ROCm 10.1.0.
 
+**Aktuelles Operator-Profil (2026-11-08).** Die laufende Instanz nutzt
+`GUFO_AUTO_SESSIONS_MAX=40`, `--sessions auto --context 250000`, einen
+17-GiB-KV-Pool (742.656 Tokens) und einen 2-GiB-RAM-Cache; rund 8 GB
+Host-Speicher bleiben frei. Ältere Zahlen in diesem Protokoll (etwa 96/150
+Sessions, 20-GiB-Pool, 7,25 GB Cache-Anteil oder 250.112 Tokens) sind
+historische Messungen des jeweiligen Entwicklungsstands. Maßgeblich ist das
+Profil in [docs/README.md](docs/README.md#current-deployment-profile-2026-11-08).
+
 ## Phase 1: Foundation (`TP-P1`, `TP-P2`, `TP-P3`, `CP-P1`)
 
 ### [ERLEDIGT] TP-P1 — Continuous Batching mit maximaler Batch-Größe
@@ -1479,7 +1487,8 @@ hochladen und mit einem quantisierten Host-Orakel vergleichen.
 
 **Device-State pro Session:** 36 lineare Layer × 786 432 Elemente × 4 B =
 113 246 208 B vorher, × 2 B = **56 623 104 B** nachher (−56,6 MB, −50 %).
-Für 64 Sessions: 7,25 GB → **3,62 GB**. Gemessen am Checkpoint-Payload
+Für die damalige 64-Session-Konfiguration: 7,25 GB → **3,62 GB**. Gemessen am
+Checkpoint-Payload
 (`artifacts/serving/d6-kv-degradation-a1.json` vs `-small4.json`): behaltene
 Snapshots **181 954 720 → 125 331 616 B** (−56 623 104 B), Runde-1-Restore
 195 971 148 → 139 348 044 B. Der D6-Lauf mit bf16-State bleibt intakt: 16/16
@@ -1638,8 +1647,10 @@ deterministische 256-Prompt-Vergleich besteht bei Kohorte 8, 16 und 32
 **256**; der Hybrid-Plan füllt die Breite, die die Resident-Kohorte hergibt.
 `--sessions auto` löst den Pool nach dem Laden aus der gemessenen
 Base-State-Kapazität (25 % Reserve), wächst mit der Nachfrage und deferred
-KV-blockierte Requests statt sie zu verwerfen. Auf diesem Host: 96 Sessions
-bei 250k, 150 bei 128k, 256 bei kurzem Kontext. `GUFO_DECODE_MAX_ROWS` und
+KV-blockierte Requests statt sie zu verwerfen. Auf diesem Host löste der
+damalige Stand 96 Sessions bei 250k, 150 bei 128k und 256 bei kurzem Kontext
+auf; das aktuelle Operator-Profil steht am Anfang dieses Protokolls.
+`GUFO_DECODE_MAX_ROWS` und
 `GUFO_ASSEMBLE_DECODE_ROWS` bleiben A/B-Overrides.
 
 **Vier messbare Decode-Hebel (2x2-A/B, 4k/256, 1024x16):**

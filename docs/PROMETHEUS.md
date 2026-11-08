@@ -73,7 +73,9 @@ config identifies it.
 | `gufo_ttft_seconds` | histogram | Submission to first generated token, for completed requests. Includes queueing and cache restore. |
 | `gufo_request_duration_seconds` | histogram | Submission to last generated token, for completed requests. |
 | `gufo_requests_processing` | gauge | Admitted requests holding or preparing a session, including cache cleanup. Matches the busy `/slots` entries. |
-| `gufo_requests_deferred` | gauge | Requests waiting for a session. |
+| `gufo_requests_deferred` | gauge | Requests waiting in the pending queue for a session. |
+| `gufo_requests_waiting` | gauge | Requests parked outside processing for shared-prefix, KV retry or preemption replay. |
+| `gufo_requests_queued` | gauge | Total pending plus parked requests; the log's `queue` column. |
 | `gufo_sessions_capacity` | gauge | Configured session slots: `--sessions`, or the resolved `auto` count. |
 | `gufo_sessions_active` | gauge | Session slots currently processing a request. |
 | `gufo_context_tokens` | gauge | Per-session context window in tokens. |
@@ -114,12 +116,13 @@ The prebuilt `gufo_prefix_cache_hit_rate` gauge computes the same ratio.
 | --- | --- | --- |
 | `gufo_prefix_cache_hits_total` | counter | Completed requests that reused at least one cached prompt token. |
 | `gufo_prefix_cache_misses_total` | counter | Completed requests that prefilled their whole prompt. |
-| `gufo_prefix_cache_hit_rate` | gauge | Cached prompt tokens over all prompt tokens seen by this process. |
-| `gufo_kv_cache_usage_ratio` | gauge | In-flight prompt and generated tokens over sessions times context. Retained cache entries are not counted. |
+| `gufo_prefix_cache_hit_rate` | gauge | Cached prompt tokens over all prompt tokens seen by this process. Zero when the RAM cache is off. |
+| `gufo_kv_cache_usage_ratio` | gauge | Used shared paged-KV pool tokens over capacity. Same value as `gufo_kv_pool_used_ratio` and the log's `ctx%`. |
 | `gufo_kv_pool_capacity_tokens` | gauge | Shared paged-KV pool capacity in tokens. |
 | `gufo_kv_pool_free_tokens` | gauge | Shared paged-KV pool tokens still free. |
 | `gufo_kv_pool_used_tokens` | gauge | `capacity - free` for the shared paged-KV pool. |
 | `gufo_kv_pool_block_tokens` | gauge | Tokens per shared KV block. |
+| `gufo_kv_pool_shared_blocks` | gauge | On Flash-Next, live prefix blocks referenced by more than one request table (refcount/COW sharing). Zero when no request shares a live prefix. |
 | `gufo_kv_pool_used_ratio` | gauge | Used shared KV-pool tokens over capacity, in the range 0 to 1. This is the log's `ctx% / 100`. |
 | `gufo_kv_pool_used_percent` | gauge | The same shared KV-pool utilization as a percentage, 0 to 100. |
 | `gufo_kv_limited_total` | counter | Prefill chunks whose size was set by free KV capacity instead of the batched-token budget. |
@@ -132,12 +135,23 @@ The prebuilt `gufo_prefix_cache_hit_rate` gauge computes the same ratio.
 | `gufo_spec_lookup_tokens_total` | counter | Prompt-lookup copies proposed. |
 | `gufo_spec_lookup_accepted_tokens_total` | counter | Prompt-lookup copies accepted. |
 
-`gufo_kv_cache_usage_ratio` is an approximation of live context occupancy: it
-counts the prompt and generated tokens held by active sessions, divided by
-`gufo_sessions_capacity * gufo_context_tokens`. It deliberately excludes
-retained host checkpoints and the block pool's free-block distribution. Use
-the block-pool figures in `usage.gufo` for per-request cache diagnosis and the
-KV pressure counters above for alerting.
+`gufo_kv_cache_usage_ratio` reports the shared paged-KV pool, so it matches the
+log's `ctx%` and `gufo_kv_pool_used_ratio` exactly. A session-based estimate
+would divide by `sessions * context` (16M tokens at 64 sessions and 250k, or
+10M at the current 40-session profile) and show well under 1% even when the
+shared pool is full; that discrepancy is why the metric now uses the pool
+snapshot. `gufo_prefix_cache_hit_rate` and
+`gufo_prefix_cache_hits_total` require the RAM cache: with `--cache-ram-bytes
+off` the hit rate stays zero and shared-prefix waiting is disabled by design.
+Live prefix sharing is visible in `gufo_kv_pool_shared_blocks`. On Flash-Next,
+the runner borrows full prefix blocks from a live leader, restores can adopt
+them by refcount, and only the partial tail block is copied. Qwen3.8-27B copies
+rows on restore. A burst of followers
+therefore keeps the shared prompt once while each request pays for its own
+tail and output. The current deployment profile uses 40 sessions, a 17 GiB
+pool (742,656 tokens) and a 2 GiB cache, so `gufo_kv_pool_capacity_tokens`
+reports 742656 after startup. Use the block-pool figures in `usage.gufo` for
+per-request cache diagnosis and the KV pressure counters above for alerting.
 
 ## Latest interval log snapshot
 
@@ -154,6 +168,8 @@ They are snapshots, not counters; use the counters above for rates and totals.
 | `gufo_stats_generated_tokens_per_second` | gauge | `win tg/s` from the latest row. |
 | `gufo_stats_admitted` | gauge | `adm` from the latest row. |
 | `gufo_stats_done` | gauge | `done` from the latest row. |
+| `gufo_stats_queue` | gauge | `queue` from the latest row. |
+| `gufo_stats_queue_max` | gauge | `queued_max` from the latest completed minute. |
 | `gufo_stats_interval_seconds` | gauge | `win s` from the latest row. |
 | `gufo_stats_failed` | gauge | `fail` from the latest row. |
 | `gufo_stats_cache_hits` | gauge | `cache` from the latest row. |
@@ -286,6 +302,7 @@ gufo_sessions_active / gufo_sessions_capacity
 gufo_kv_cache_usage_ratio
 gufo_kv_pool_used_ratio
 gufo_kv_pool_used_percent
+gufo_kv_pool_shared_blocks
 sum(rate(gufo_kv_limited_total[5m]))
 sum(rate(gufo_kv_deferred_total[5m]))
 sum(rate(gufo_preemptions_total[5m]))
