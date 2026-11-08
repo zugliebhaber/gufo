@@ -43,6 +43,8 @@ code addition, the entry says so.
 | API | Model alias fallback | Keep OpenAI clients working when they send an alias or no model name | [PROGRESS](../PROGRESS.md) |
 | API | Stop-sequence and text-span hardening | Avoid undefined behavior and lost text spans on edge inputs | [PROGRESS](../PROGRESS.md) |
 | Diagnostics | `gufo diagnose` power-profile check | Make the clock state part of the measurement record | [ARCHITECTURE](ARCHITECTURE.md) |
+| Diagnostics | Periodic text stats (10 s table, 60 s request line) | Make cache/throughput behavior visible without per-request log noise | [SERVER](SERVER.md#troubleshooting-logs) |
+| Observability | Prometheus `/metrics` and Grafana dashboard | Track request outcomes, TTFT, duration, tokens, sessions, cache, KV pressure and memory in a standard monitoring stack | [PROMETHEUS](PROMETHEUS.md), [GRAFANA](GRAFANA.md) |
 | Tooling | `tools/bench/gather_bw.hip` | Separate sparse-gather from kernel inefficiency when calibrating DRAM bandwidth | [gather_bw.hip](../tools/bench/gather_bw.hip) |
 | Tooling | Paging and FP8 KV benches | Measure block-table overhead and the FP8 memory/speed trade | [kv_paging_bench.hip](../tools/bench/kv_paging_bench.hip), [kv_fp8_attention.hip](../tools/bench/kv_fp8_attention.hip) |
 | Tooling | Serving sweep tools | Sweep session count, chunk size and concurrency for a model | [serving_sweep.py](../tools/gufo/serving_sweep.py) |
@@ -134,8 +136,10 @@ divides measured free state capacity by the per-session base state (block
 table, index and recurrent state, not the shared KV rows) and keeps a 25 %
 reserve. The scheduler starts with one resident session, grows toward visible
 demand, returns to one when idle, and defers KV-blocked requests instead of
-failing them. Fixed-session servers keep the old behavior; image, audio,
-embedding and video servers do not accept `auto`.
+failing them. `GUFO_AUTO_SESSIONS_MAX=N` caps the resolved count below the
+memory fit (default 256); the current deployment uses 64. Fixed-session servers
+keep the old behavior; image, audio, embedding and video servers do not accept
+`auto`.
 
 Purpose: do not force the operator to choose between latency and aggregate
 throughput before the workload is known.
@@ -222,9 +226,10 @@ Evidence: `PROGRESS.md` `PA-P4`/`KV-P1`/`KV-P2`/`B3`,
 ### Prefix-cache hit-rate metrics
 
 Per request, `cache_hit_rate` and `cached_tokens` report reuse; globally
-`llamacpp:prefix_cache_hits_total`, `llamacpp:prefix_cache_misses_total` and
-`llamacpp:prefix_cache_hit_rate` expose it from `/metrics`. Counters advance
-once per completed request, including cancellations, with no double count.
+`gufo_prefix_cache_hits_total`, `gufo_prefix_cache_misses_total` and
+`gufo_prefix_cache_hit_rate` expose it from `/metrics`. The legacy
+`llamacpp:*` families remain with the same values. Counters advance once per
+completed request, including cancellations, with no double count.
 
 Purpose: measure cache value directly instead of inferring it from wall time.
 
@@ -450,6 +455,25 @@ endpoints.
   `tools/serving/gufo-serving-sweep.py` sweep session count, chunk size and
   concurrency for a model. Purpose: find the batch knee without a bespoke
   harness. Evidence: the two scripts and `PROGRESS.md` `TP-P1`.
+- **Periodic text statistics.** Text serving logs a 10 s interval table
+  (`conc | pp/s req tg/s req TTFT | win pp/s win tg/s req/s win s fail cache`)
+  and a once-per-minute completed-request line. Every row reports the
+  difference from the previous snapshot, so idle rows show zero rather than
+  lifetime averages. The table header follows the minute line; per-request
+  receipt/completion, scheduler batch/prefill and cache acquire/retention
+  details move to DEBUG. Purpose: keep the log vLLM-like and correlate the
+  shared pool with interval throughput. Evidence: `text_generation_scheduler.cpp`
+  (`LogStats`, `LogCompletedWindow`), `docs/SERVER.md`.
+- **Prometheus metrics and Grafana dashboard.** `/metrics` (alias
+  `/v1/metrics`) exposes request outcomes, TTFT and duration histograms, token
+  and cache counters, session occupancy, KV pressure and process/host memory.
+  Legacy `llamacpp:*` families remain; `gufo_*` aliases use Prometheus-native
+  names. The dashboard under `deploy/grafana/` tracks request rate, success
+  ratio, latency quantiles, throughput, sessions, cache, KV pressure and
+  memory. Purpose: make the shared pool and queueing observable in a standard
+  monitoring stack. Evidence: `src/cli/serve/generation_metrics.hpp`,
+  `LlamaMetrics` in `http_server.cpp`, `docs/PROMETHEUS.md`,
+  `docs/GRAFANA.md`, `deploy/grafana/gufo-dashboard.json`.
 - **Batch-throughput catalog.** `docs/BATCH-THROUGHPUT.md` ranks 52 measures
   with retained/rejected status and measured numbers. Purpose: keep optimization
   decisions evidence-based and prevent re-testing rejected ideas.
@@ -457,9 +481,9 @@ endpoints.
   links, anchors, JSON code blocks and Mermaid fences/kinds. Purpose: fail CI
   on stale docs. Evidence: `docs/README.md#documentation-checks`.
 - **New documentation.** `ARCHITECTURE.md`, `KV-CACHE-VISUAL.md`,
-  `N-LEVERS.md`, `BATCH-THROUGHPUT.md`, `paged-kv.md`, this page and
-  `PROGRESS.md` document the design, the page tables, the measured levers and
-  the negative results.
+  `N-LEVERS.md`, `BATCH-THROUGHPUT.md`, `PROMETHEUS.md`, `GRAFANA.md`,
+  `paged-kv.md`, this page and `PROGRESS.md` document the design, the page
+  tables, the measured levers, the monitoring stack and the negative results.
 
 ## 6. Upstream foundation (not repeated here)
 

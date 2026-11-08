@@ -87,6 +87,34 @@ sampling defaults/overrides, tools, thinking, images, concurrent isolation,
 cancellation and RAM/disk replay. Select focused suites and the affected
 AR/speculative model modes; full model runs stay outside hosted CI.
 
+## Metrics and monitoring
+
+`http_server_test` covers the exposition without loading weights: HELP/TYPE
+families, request counters, both histograms, session/memory gauges and the
+`gufo_*` aliases. The functional metrics suite starts an isolated server and
+reconciles completed and cancelled work against the terminal logs, slots and
+KV ratio:
+
+```sh
+cmake --preset cpu-test
+cmake --build --preset cpu-test --target http_server_test
+./build/cpu-test/http_server_test
+
+python3 tests/functional/run.py \
+  --record-baseline --sampling-preset qwen38 --suite metrics --tier pr -- \
+  build/release/gufo serve llm --model MODEL --speculative off \
+  --cache-retain-cold
+```
+
+The metrics suite's warm-retry assertion expects the first unique prompt to be
+retained; `--cache-retain-cold` supplies that precondition. Use the affected
+speculative mode instead of `off` when changing mode-specific counters.
+
+For a live server, validate the exposition and dashboard references as shown
+in [Prometheus validation](PROMETHEUS.md#validation-and-troubleshooting) and
+[Grafana validation](GRAFANA.md#validation). Documentation changes still need
+`python3 tools/ci/check-docs.py --root .`.
+
 ## Match validation to the change
 
 | Change | Relevant checks |
@@ -97,6 +125,7 @@ AR/speculative model modes; full model runs stay outside hosted CI.
 | Attention or state layout | long-context boundaries, snapshot/restore, fresh-versus-reused state |
 | Sampling/speculation | distributions, proposal/rejection/residual draws, seeded replay, EOS commit |
 | Scheduler/server | direct-versus-HTTP behavior, independent batched requests, multi-turn reuse, cancellation, failure and shutdown |
+| Metrics/monitoring | `http_server_test` metric assertions, live `/metrics` scrape validation, `run.py --suite metrics`, dashboard metric-reference check |
 | Performance | affected quality gates followed by one comparable release measurement |
 
 Broaden testing when a change crosses shared ownership boundaries or a failure

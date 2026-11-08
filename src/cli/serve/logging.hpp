@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_LOGGING_HPP_
 #define GUFO_SERVER_LOGGING_HPP_
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -70,6 +71,15 @@ public:
 
   /// Process RSS and host available memory; these are not additive GPU totals.
   static std::string MemoryStatus();
+
+  /// Process resident set in bytes, or zero when the host cannot report it.
+  /// `MemoryStatus` prints the same reading in MiB for request logs.
+  static std::size_t ResidentBytes();
+
+  /// Host memory available to new allocations in bytes, or zero when the host
+  /// cannot report it. This is the unified-memory headroom Gufo schedules
+  /// against, not a GPU-only figure.
+  static std::size_t HostAvailableBytes();
 
   /// Convenience helpers
   static void Debug(std::string_view component, std::string_view message) {

@@ -298,6 +298,24 @@ The canonical 8/16/24/32 table and the latest on/off A/B live in
 `docs/models/qwen3.8-flash-next/BENCHMARKS.md` and the
 [N-LEVERS](models/qwen3.8-flash-next/N-LEVERS.md).
 
+### Operational observability
+
+The scheduler and HTTP transport keep two measurement layers. Per request,
+`Server-Timing`, generation `timings` and Chat Completions `usage.gufo`
+describe one call. Process-wide counters and histograms in
+`src/cli/serve/generation_metrics.hpp` describe the whole text server and are
+snapshotted by `GET /metrics` (alias `/v1/metrics`) on the normal listener.
+
+The exposition includes finished-request outcomes, TTFT and end-to-end
+duration histograms, prompt/generated token counters, prefix-cache reuse,
+preemption and KV pressure, session occupancy, and process/host memory. The
+`llamacpp:*` families remain for llama.cpp-compatible tooling; `gufo_*` names
+are the stable Prometheus-native aliases. A Prometheus server scrapes the
+endpoint, and the shipped Grafana dashboard visualizes request rate, success
+ratio, latency quantiles, throughput, sessions, cache, KV pressure and memory.
+See [Prometheus metrics](PROMETHEUS.md) and
+[Grafana dashboard](GRAFANA.md).
+
 ## 8. Architecture decisions
 
 ### ADR-1: One process, many resident sessions, one model stream

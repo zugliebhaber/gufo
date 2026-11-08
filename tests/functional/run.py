@@ -341,6 +341,10 @@ def main():
                           ("--max-pending-per-client", str(max(4, sessions)))):
         if option(command, flag) is None:
             command += [flag, default]
+    # Functional suites parse per-request received/completed lines. Text
+    # serving keeps those at DEBUG and prints the periodic summary at INFO.
+    if option(command, "--log-level") is None and "-v" not in command:
+        command += ["--log-level", "debug"]
     if disk_enabled:
         command += ["--cache-disk", str(output / "disk"),
                     "--cache-disk-bytes", str(8 * 1024**3),

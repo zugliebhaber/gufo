@@ -268,6 +268,11 @@ def main():
             parser.error(f"the runner owns {reserved}")
     if option(command, "--served-model-name") is None:
         command += ["--served-model-name", "publication-wait"]
+    # Retention and acquisition details are debug-tier; this runner inspects
+    # them as part of its publication evidence.
+    if (option(command, "--log-level") is None and "-v" not in command
+            and "--verbose" not in command):
+        command += ["--log-level", "debug"]
     args.output.mkdir(parents=True, exist_ok=False)
     report = {**provenance(), "cases": {}, "expect": args.expect,
               "workload_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

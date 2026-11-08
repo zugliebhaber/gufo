@@ -85,6 +85,7 @@ CapturedLogs CaptureTraffic(LogLevel level) {
   {
     RunningServer server;
     ExpectStatus(server.Send("GET /health HTTP/1.1\r\n\r\n"), 200);
+    ExpectStatus(server.Send("GET /v1/models HTTP/1.1\r\n\r\n"), 200);
     const auto response = server.Post(
         "/v1/chat/completions?private-query",
         R"({"model":"test","messages":[{"role":"user","content":"private-prompt"}],"stream":true})");
@@ -112,17 +113,21 @@ CapturedLogs CaptureTraffic(LogLevel level) {
 void TestRequestLogging() {
   const CapturedLogs info = CaptureTraffic(LogLevel::kInfo);
   const std::string& log = info.text;
-  assert(log.find("request=" + info.request_id + " event=received") !=
+  // Text generation is summarised by the scheduler's periodic stats, not by
+  // per-request INFO lines. The received/completed lines for the chat request
+  // are DEBUG-tier; failures still escalate below.
+  assert(log.find("request=" + info.request_id + " event=received") ==
          std::string::npos);
-  assert(log.find("request=" + info.request_id + " event=completed") !=
+  assert(log.find("request=" + info.request_id + " event=completed") ==
          std::string::npos);
-  assert(log.find("cache=memory") != std::string::npos);
-  assert(log.find("acceptance_pct=50.0") != std::string::npos);
+  assert(log.find("cache=memory") == std::string::npos);
+  assert(log.find("acceptance_pct=50.0") == std::string::npos);
   assert(log.find("rss_mib=") != std::string::npos);
   assert(log.find("error_code=server_exception") != std::string::npos);
-  // A successful poll is quiet at the default level, and so is the received
-  // line for a GET that is not on the inference list.
+  // Successful health and model-list polls are quiet at the default level,
+  // as is the received line for a GET that is not on the inference list.
   assert(log.find("path=/health") == std::string::npos);
+  assert(log.find("path=/v1/models") == std::string::npos);
   // Statuses never are: 4xx keeps escalating to WARN under any filter.
   assert(log.find("path=/not-a-route status=404") != std::string::npos);
   assert(log.find("[WARN]") != std::string::npos);
@@ -138,10 +143,15 @@ void TestRequestLogging() {
   assert(debug.text.find("event=received method=GET path=/health") !=
          std::string::npos);
   assert(debug.text.find("path=/health status=200") != std::string::npos);
-  // Debug adds lines; it must not downgrade an inference completion to DEBUG,
-  // nor pull a refused 4xx back under the threshold.
-  assert(debug.text.find("[INFO] [http] request=" + debug.request_id +
+  assert(debug.text.find("event=received method=GET path=/v1/models") !=
+         std::string::npos);
+  assert(debug.text.find("path=/v1/models status=200") != std::string::npos);
+  // Text generation success lives at DEBUG; a refused 4xx must still
+  // escalate to WARN rather than being pulled under the threshold.
+  assert(debug.text.find("[DEBUG] [http] request=" + debug.request_id +
                          " event=completed") != std::string::npos);
+  assert(debug.text.find("cache=memory") != std::string::npos);
+  assert(debug.text.find("acceptance_pct=50.0") != std::string::npos);
   assert(debug.text.find("path=/not-a-route status=404") != std::string::npos);
   // The higher tier must still hide every byte of the request.
   assert(debug.text.find("private-query") == std::string::npos);
@@ -528,6 +538,83 @@ void TestFallbackBackendMetrics() {
 
 // /props reports what the server runs, as llama-server's does, so a client
 // can record which model, build and settings answered it.
+void TestPrometheusMetrics() {
+  namespace metrics = gufo::server::detail;
+  RunningServer server;
+  const auto completed_before = metrics::TotalRequestsCompleted().load();
+  const auto cancelled_before = metrics::TotalRequestsCancelled().load();
+  const auto failed_before = metrics::TotalRequestsFailed().load();
+  const auto ttft_before = metrics::TtftHistogram().count.load();
+  const auto duration_before = metrics::RequestDurationHistogram().count.load();
+
+  server.backend->sessions.resize(2);
+  server.backend->sessions[1] = {
+      .processing = true,
+      .request_id = 7,
+      .prompt_tokens = 9,
+      .generated_tokens = 1,
+  };
+  ExpectStatus(
+      server.Post("/v1/completions", R"({"prompt":"hi","max_tokens":1})"), 200);
+  assert(metrics::TotalRequestsCompleted().load() == completed_before + 1);
+  assert(metrics::TtftHistogram().count.load() == ttft_before + 1);
+  assert(metrics::RequestDurationHistogram().count.load() ==
+         duration_before + 1);
+
+  const auto response = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+  ExpectStatus(response, 200);
+  assert(response.find("Content-Type: text/plain; version=0.0.4; "
+                       "charset=utf-8") != std::string::npos);
+  assert(response.find("# TYPE gufo_requests_total counter\n") !=
+         std::string::npos);
+  assert(response.find("gufo_requests_total{status=\"completed\"} " +
+                       std::to_string(completed_before + 1) + "\n") !=
+         std::string::npos);
+  assert(response.find("gufo_requests_total{status=\"cancelled\"} " +
+                       std::to_string(cancelled_before) + "\n") !=
+         std::string::npos);
+  assert(response.find("gufo_requests_total{status=\"failed\"} " +
+                       std::to_string(failed_before) + "\n") !=
+         std::string::npos);
+  for (const std::string name :
+       {"gufo_ttft_seconds", "gufo_request_duration_seconds"}) {
+    assert(response.find("# TYPE " + name + " histogram\n") !=
+           std::string::npos);
+    assert(response.find(name + "_bucket{le=\"0.001\"} ") != std::string::npos);
+    assert(response.find(name + "_bucket{le=\"+Inf\"} ") != std::string::npos);
+    assert(response.find(name + "_sum ") != std::string::npos);
+    assert(response.find(name + "_count ") != std::string::npos);
+  }
+  for (const std::string gauge :
+       {"gufo_sessions_capacity", "gufo_sessions_active", "gufo_context_tokens",
+        "gufo_process_resident_memory_bytes",
+        "gufo_host_available_memory_bytes", "gufo_prefix_cache_hit_rate",
+        "gufo_kv_cache_usage_ratio"}) {
+    assert(response.find("# TYPE " + gauge + " gauge\n") != std::string::npos);
+  }
+  assert(response.find("gufo_sessions_capacity 2\n") != std::string::npos);
+  assert(response.find("gufo_sessions_active 1\n") != std::string::npos);
+  assert(response.find("gufo_context_tokens 65536\n") != std::string::npos);
+  for (const std::string counter :
+       {"gufo_prompt_tokens_total", "gufo_prompt_tokens_cached_total",
+        "gufo_tokens_generated_total", "gufo_requests_total",
+        "gufo_prefix_cache_hits_total", "gufo_spec_draft_rounds_total"}) {
+    assert(response.find("# TYPE " + counter + " counter\n") !=
+           std::string::npos);
+  }
+
+  TextGenerationBackend::Result cancelled;
+  cancelled.cancelled = true;
+  gufo::server::RecordServerMetrics(cancelled);
+  assert(metrics::TotalRequestsCancelled().load() == cancelled_before + 1);
+  assert(metrics::TotalRequestsCompleted().load() == completed_before + 1);
+  gufo::server::RecordFailedRequest();
+  assert(metrics::TotalRequestsFailed().load() == failed_before + 1);
+  assert(metrics::TtftHistogram().count.load() == ttft_before + 1);
+  assert(metrics::RequestDurationHistogram().count.load() ==
+         duration_before + 1);
+}
+
 void TestLlamaProps() {
   RunningServer server;
   const auto props = [&](const std::string& path) {
@@ -3536,6 +3623,7 @@ int main() {
   TestFramingAndMetrics();
   TestExpectContinue();
   TestFallbackBackendMetrics();
+  TestPrometheusMetrics();
   TestLlamaProps();
   TestApplyTemplate();
   TestOpenAiInputTokens();

@@ -1,6 +1,7 @@
 #include "src/cli/serve/http_server.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
@@ -21,6 +22,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <stop_token>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -1573,6 +1576,32 @@ double PrefixCacheHitRateTotal() {
                     : static_cast<double>(cached) / static_cast<double>(total);
 }
 
+/// Appends one fixed-bucket Prometheus histogram. Counts are stored
+/// cumulatively, so the exposition repeats them per bucket as the format
+/// requires. `+Inf` uses the total observation count.
+template<std::size_t N>
+void WriteHistogram(std::ostringstream& out, std::string_view name,
+                    std::string_view help,
+                    const detail::Histogram<N>& histogram,
+                    const std::array<double, N>& bounds) {
+  out << "# HELP " << name << ' ' << help << "\n"
+      << "# TYPE " << name << " histogram\n";
+  const auto flags = out.flags();
+  const auto precision = out.precision();
+  out << std::setprecision(6);
+  for (std::size_t i = 0; i < N; ++i) {
+    out << name << "_bucket{le=\"" << bounds[i] << "\"} "
+        << histogram.cumulative[i].load(std::memory_order_relaxed) << "\n";
+  }
+  out.flags(flags);
+  out.precision(precision);
+  const auto count = histogram.count.load(std::memory_order_relaxed);
+  out << name << "_bucket{le=\"+Inf\"} " << count << "\n"
+      << name << "_sum " << histogram.sum.load(std::memory_order_relaxed)
+      << "\n"
+      << name << "_count " << count << "\n";
+}
+
 HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
   std::ostringstream out;
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
@@ -1693,10 +1722,129 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
          "tokens over sessions times context; excludes retained cache\n"
       << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
       << "llamacpp:kv_cache_usage_ratio " << KvCacheUsageRatio(b) << "\n";
+
+  // Stable gufo_* aliases plus request-level application metrics. The
+  // llamacpp:* families above stay for existing dashboards and llama.cpp
+  // tooling and carry the same values.
+  const auto counter = [&out](std::string_view name, std::string_view help,
+                              auto value) {
+    out << "# HELP " << name << ' ' << help << "\n"
+        << "# TYPE " << name << " counter\n"
+        << name << ' ' << value << "\n";
+  };
+  const auto gauge = [&out](std::string_view name, std::string_view help,
+                            auto value) {
+    out << "# HELP " << name << ' ' << help << "\n"
+        << "# TYPE " << name << " gauge\n"
+        << name << ' ' << value << "\n";
+  };
+
+  const auto prompt_tokens =
+      detail::TotalPromptTokens().load(std::memory_order_relaxed);
+  const auto cached_prompt_tokens =
+      detail::TotalCachedPromptTokens().load(std::memory_order_relaxed);
+  const auto generated_tokens =
+      detail::TotalGenTokens().load(std::memory_order_relaxed);
+  counter("gufo_prompt_tokens_total",
+          "Prompt tokens processed, excluding cache hits", prompt_tokens);
+  counter("gufo_prompt_tokens_cached_total", "Prompt tokens reused from cache",
+          cached_prompt_tokens);
+  counter("gufo_prefix_cache_hits_total",
+          "Completed requests that reused at least one cached prompt token",
+          detail::PrefixCacheHits().load(std::memory_order_relaxed));
+  counter("gufo_prefix_cache_misses_total",
+          "Completed requests that prefilled their whole prompt",
+          detail::PrefixCacheMisses().load(std::memory_order_relaxed));
+  gauge("gufo_prefix_cache_hit_rate",
+        "Cached prompt tokens over all prompt tokens seen by this process",
+        PrefixCacheHitRateTotal());
+  counter("gufo_prompt_seconds_total", "Prompt process time",
+          detail::TotalPromptSeconds().load(std::memory_order_relaxed));
+  counter("gufo_tokens_generated_total", "Total tokens generated",
+          generated_tokens);
+  counter("gufo_tokens_generated_seconds_total", "Token generation time",
+          detail::TotalGenSeconds().load(std::memory_order_relaxed));
+  gauge("gufo_max_sequence_tokens",
+        "Largest observed prompt plus generated "
+        "sequence",
+        detail::MaxSequenceTokens().load(std::memory_order_relaxed));
+  counter("gufo_spec_draft_rounds_total", "Speculative verification rounds",
+          detail::TotalDraftRounds().load(std::memory_order_relaxed));
+  counter("gufo_spec_draft_tokens_total", "Draft tokens proposed",
+          detail::TotalDraftTokens().load(std::memory_order_relaxed));
+  counter("gufo_spec_accepted_tokens_total", "Draft tokens accepted",
+          detail::TotalDraftAcceptedTokens().load(std::memory_order_relaxed));
+  gauge("gufo_prompt_tokens_per_second",
+        "Prompt processing speed of the latest completed request",
+        detail::LastPromptSpeed().load(std::memory_order_relaxed));
+  gauge("gufo_tokens_per_second",
+        "Generation speed of the latest completed request",
+        detail::LastGenSpeed().load(std::memory_order_relaxed));
+  gauge("gufo_requests_processing",
+        "Admitted requests, including cache preparation and cleanup",
+        detail::RequestsProcessing().load(std::memory_order_relaxed));
+  gauge("gufo_requests_deferred", "Requests waiting for a session",
+        detail::RequestsDeferred().load(std::memory_order_relaxed));
+  counter("gufo_preemptions_total",
+          "Model states released for RECOMPUTE preemption",
+          detail::TotalPreemptions().load(std::memory_order_relaxed));
+  counter("gufo_recompute_tokens_total",
+          "Prompt and generated tokens replayed after RECOMPUTE preemption",
+          detail::TotalRecomputeTokens().load(std::memory_order_relaxed));
+  counter("gufo_kv_limited_total",
+          "Prefill chunks bounded by free KV capacity instead of the "
+          "batched-token budget",
+          detail::TotalKvLimited().load(std::memory_order_relaxed));
+  counter("gufo_kv_deferred_total",
+          "Requests degraded to their host snapshot when the device KV pool "
+          "refused blocks",
+          detail::TotalKvDeferrals().load(std::memory_order_relaxed));
+  gauge("gufo_kv_cache_usage_ratio",
+        "In-flight prompt and generated tokens over sessions times context; "
+        "excludes retained cache",
+        KvCacheUsageRatio(b));
+
+  const auto completed =
+      detail::TotalRequestsCompleted().load(std::memory_order_relaxed);
+  const auto cancelled =
+      detail::TotalRequestsCancelled().load(std::memory_order_relaxed);
+  const auto failed =
+      detail::TotalRequestsFailed().load(std::memory_order_relaxed);
+  out << "# HELP gufo_requests_total Finished requests by outcome\n"
+      << "# TYPE gufo_requests_total counter\n"
+      << "gufo_requests_total{status=\"completed\"} " << completed << "\n"
+      << "gufo_requests_total{status=\"cancelled\"} " << cancelled << "\n"
+      << "gufo_requests_total{status=\"failed\"} " << failed << "\n";
+  WriteHistogram(out, "gufo_ttft_seconds",
+                 "Seconds from request submission to the first generated "
+                 "token",
+                 detail::TtftHistogram(), detail::kLatencyBuckets);
+  WriteHistogram(out, "gufo_request_duration_seconds",
+                 "Seconds from request submission to the last generated token",
+                 detail::RequestDurationHistogram(), detail::kLatencyBuckets);
+
+  const auto sessions = b.session_states();
+  std::size_t active_sessions = 0;
+  for (const auto& session : sessions) {
+    active_sessions += session.processing ? 1 : 0;
+  }
+  gauge("gufo_sessions_capacity", "Configured text session slots",
+        sessions.size());
+  gauge("gufo_sessions_active", "Text session slots processing a request",
+        active_sessions);
+  gauge("gufo_context_tokens", "Per-session context window in tokens",
+        b.max_context());
+  gauge("gufo_process_resident_memory_bytes", "Process resident set size",
+        Logger::ResidentBytes());
+  gauge("gufo_host_available_memory_bytes",
+        "Host memory available to new allocations",
+        Logger::HostAvailableBytes());
+
   return {.status = 200,
           .reason = "OK",
           .body = out.str(),
-          .headers = {{"Content-Type", "text/plain; version=0.0.4"}}};
+          .headers = {
+              {"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}}};
 }
 
 // Numeric literals only, so the listener never depends on name resolution.
@@ -2501,16 +2649,23 @@ void HttpServer::handle_connection(int client_fd,
       }
     }
 
-    // Successful health/metrics polling and video status polling stay quiet at
-    // the default level. Under --log-level=debug they become visible, because
-    // "is anything actually arriving?" is the first question an operator asks
-    // when a client reports a hang.
-    const bool log_request =
-        req.method == "POST" || req.method == "DELETE" ||
-        req.path == "/v1/models" || req.path.ends_with("/content") ||
-        req.path == "/v1/realtime" || req.path == "/v1/audio/speech/stream";
+    // Successful health, metrics, model-list and video-status polling stays
+    // quiet at the default level. Under --log-level=debug it becomes visible,
+    // because "is anything actually arriving?" is the first question an
+    // operator asks when a client reports a hang. Text generation is
+    // summarised by the scheduler's periodic stats instead of one INFO line
+    // per request.
+    const bool log_request = req.method == "POST" || req.method == "DELETE" ||
+                             req.path.ends_with("/content") ||
+                             req.path == "/v1/realtime" ||
+                             req.path == "/v1/audio/speech/stream";
+    const bool text_generation =
+        req.path == "/v1/completions" || req.path == "/v1/chat/completions" ||
+        req.path == "/v1/responses" || req.path == "/v1/messages" ||
+        req.path == "/completion";
     const LogLevel request_level =
-        log_request ? LogLevel::kInfo : LogLevel::kDebug;
+        text_generation ? LogLevel::kDebug
+                        : (log_request ? LogLevel::kInfo : LogLevel::kDebug);
     // The tier check subsumes the method test: receipt lines are kInfo for
     // the methods above and kDebug otherwise, so a quiet tier that discards
     // the line also skips the concatenation that would build it.

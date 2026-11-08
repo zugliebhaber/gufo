@@ -533,8 +533,9 @@ beyond the budget.
 
 ### Operational diagnostics
 
-- `GET /metrics` exposes `llamacpp:kv_cache_usage_ratio` and the
-  `kv_limited_total`/`kv_deferred_total` counters.
+- `GET /metrics` exposes `gufo_kv_cache_usage_ratio`,
+  `gufo_kv_limited_total` and `gufo_kv_deferred_total`; the legacy
+  `llamacpp:*` names remain for llama.cpp-compatible dashboards.
 - A text response's `usage.gufo.component_cache.global_kv_pool` reports
   `capacity_blocks`, `live_blocks`, `free_blocks`, `high_water_blocks` and
   `block_bytes`.

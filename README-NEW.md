@@ -111,6 +111,7 @@ pool and on batch throughput; the sections below explain the mechanism.
 | API | Artifact validator hardening | No KV change | Keeps measurement runs from aborting |
 | Diagnostics | `gufo diagnose` power-profile check | Reports pool and clock state | Makes measurements comparable |
 | Tooling | `gather_bw.hip`, paging/FP8 benches, serving sweep | Reproducible pool and bandwidth experiments | Finds the batch knee without a bespoke harness |
+| Observability | Prometheus `/metrics` and Grafana dashboard | Exposes pool, cache, queue and session state | Correlates throughput with queueing and KV pressure |
 | Docs | Architecture, KV visual, N-LEVERS, 52-measure catalog | Explains the pool and its invariants | Records retained/rejected throughput levers |
 
 ## Shared KV cache pool
@@ -197,10 +198,14 @@ and the decode cohort width.
 If a request cannot get device KV blocks, the scheduler keeps its completed
 prefill as a host snapshot, releases device state, and retries admission after
 residents finish. Per request, `cached_tokens` and `cache_hit_rate` report
-reuse; globally `llamacpp:prefix_cache_hits_total`,
-`llamacpp:prefix_cache_misses_total` and `llamacpp:prefix_cache_hit_rate`
-expose the same. A 700 MB pool under a 16-session load completed 32/32
-requests with 37 degradations and no device loss.
+reuse; globally `gufo_prefix_cache_hits_total`,
+`gufo_prefix_cache_misses_total` and `gufo_prefix_cache_hit_rate` expose the
+same values, with the legacy `llamacpp:*` families retained. A 700 MB pool
+under a 16-session load completed 32/32 requests with 37 degradations and no
+device loss. Request outcomes, TTFT/duration histograms, session occupancy,
+KV pressure and memory are documented in
+[Prometheus metrics](docs/PROMETHEUS.md) and
+[Grafana dashboard](docs/GRAFANA.md).
 
 **Why it matters for the shared pool:** a tight pool costs latency, not
 correctness; the snapshot preserves the prefilled prefix. **Why it matters for
@@ -436,16 +441,21 @@ measures is [docs/BATCH-THROUGHPUT.md](docs/BATCH-THROUGHPUT.md).
 
 ## Concurrency benchmark
 
-This is the measured batch-serving curve. The columns are:
+This is a completed benchmark run, not the live server log. The columns are:
 
 - `conc` — concurrent requests,
 - `pp/s req` and `tg/s req` — per-request prefill and decode token rates,
 - `TTFT ms` — time to first token; most rows report 0, the row at concurrency
   29 shows an isolated 525 ms sample,
-- `tot pp/s` and `tot tg/s` — aggregate prompt and generated token rates,
+- `tot pp/s` and `tot tg/s` — aggregate prompt and generated token rates over
+  the whole run,
 - `req/s` — completed requests per second,
 - `wall s` — wall time for the run,
 - `fail` — failed requests, `cache` — cache hits.
+
+The live server prints a 10 s interval table with `win pp/s` / `win tg/s` and
+`win s`; every row is the delta since the previous row, so idle rows report
+zero rather than the run average.
 
 ```text
 conc |  pp/s req  tg/s req  TTFT ms |  tot pp/s  tot tg/s   req/s  wall s  fail  cache
@@ -595,6 +605,7 @@ Settings that matter for the two design goals:
 | --- | --- | --- |
 | context per session | `--context N` | Long prompts or many sessions; Flash-Next above 262144 needs `--enable-yarn` |
 | resident sessions | `--sessions N\|auto` | `auto` fits the pool from base state; fixed values cap the resident count |
+| auto-session cap | `GUFO_AUTO_SESSIONS_MAX=N` | cap the resolved auto pool (default 256 or the memory fit); the current deployment uses 64 |
 | prefill work unit | `--prefill-chunk N` | Larger units amortise expert reads; the scheduler also shrinks to free KV |
 | RAM prefix cache | `--cache-ram-bytes N\|off` | Keep repeated/shared prefixes warm; `off` for cold benchmark runs |
 | cold retention | `--cache-retain-cold` | Opt unique single-turn prompts into retention |
@@ -606,7 +617,14 @@ Settings that matter for the two design goals:
 | request coalescing | `GUFO_REQUEST_COALESCE=1` | Byte-identical greedy requests share one stream |
 | HTTP limits | `--max-connections`, `--max-pending`, `--max-pending-per-client` | Protect the machine from bursts |
 | stall watchdog | `--stall-timeout-ms N` | Restart a wedged device instead of hanging |
+| logging | `--log-level error\|warn\|info\|debug` | INFO prints the 10 s stats table and minute request line; DEBUG adds per-request, scheduler and cache detail |
 | served name | `--served-model-name ID` | Client-facing model id |
+
+Monitoring needs no flag: `GET /metrics` (alias `/v1/metrics`) exposes
+Prometheus text for request outcomes, TTFT and duration, tokens, cache reuse,
+sessions, KV pressure and memory. Scrape configuration and the complete metric
+catalog are in [Prometheus metrics](docs/PROMETHEUS.md); the importable
+dashboard and provisioning are in [Grafana dashboard](docs/GRAFANA.md).
 
 Serving recipes:
 
@@ -693,6 +711,8 @@ acquired separately from their publishers.
 - [Batch throughput](docs/BATCH-THROUGHPUT.md) — 52 measures with retained and
   rejected status
 - [Server contract](docs/SERVER.md) and [CLI guide](docs/CLI.md)
+- [Prometheus metrics](docs/PROMETHEUS.md) and
+  [Grafana dashboard](docs/GRAFANA.md)
 - [Benchmark methodology](docs/BENCHMARKS.md) and
   [performance loop](docs/PERFORMANCE.md)
 - [Progress log](PROGRESS.md) — chronological engineering record with rejected

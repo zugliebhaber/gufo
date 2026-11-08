@@ -568,8 +568,9 @@ The metrics suite reconciles verification-round counts with request timings and
 terminal logs, including cancelled requests; AR must report zero rounds and
 speculative modes must execute actual rounds.
 For metrics changes, run `--suite metrics` with AR and the affected speculative
-mode. It checks all three text endpoints and reconciles cancelled work with the
-terminal logs. It also checks both slot endpoints, active request identities and
+mode; pass server `--cache-retain-cold`, because the suite's warm-retry
+assertion expects the first unique prompt to be retained. It checks all three
+text endpoints and reconciles cancelled work with the terminal logs. It also checks both slot endpoints, active request identities and
 progress, queued-request exclusion, prompt privacy, idle cleanup, and the
 in-flight KV ratio. Concurrent shared-prefix requests also check that parked
 followers reserve slots and keep newer arrivals queued within `--sessions`.

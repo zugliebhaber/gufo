@@ -2,6 +2,7 @@
 #define GUFO_SERVER_GENERATION_METRICS_HPP_
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <iomanip>
@@ -114,7 +115,67 @@ inline std::atomic<std::uint64_t>& TotalKvDeferrals() {
   static std::atomic<std::uint64_t> count{0};
   return count;
 }
+// Finished-request outcomes. A request lands in exactly one bucket: completed
+// and cancelled are recorded by RecordRequestMetrics, failures by
+// RecordFailedRequest. Failed requests also keep the token counters of the
+// work they did, like cancellations.
+inline std::atomic<std::uint64_t>& TotalRequestsCompleted() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<std::uint64_t>& TotalRequestsCancelled() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<std::uint64_t>& TotalRequestsFailed() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+// One fixed bucket layout for TTFT and end-to-end request duration, so a
+// scrape is self-contained and no request samples stay in memory. The upper
+// end covers long-context prefill; +Inf is implied by the count.
+inline constexpr std::array<double, 26> kLatencyBuckets{
+    0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08,  0.1,  0.25,
+    0.5,   0.75,  1.0,  1.5,  2.0,  2.5,  5.0,   7.5,  10.0,
+    15.0,  20.0,  30.0, 40.0, 50.0, 60.0, 120.0, 300.0};
+template<std::size_t N>
+struct Histogram {
+  std::array<std::atomic<std::uint64_t>, N> cumulative{};
+  std::atomic<std::uint64_t> count{0};
+  std::atomic<double> sum{0.0};
+};
+inline Histogram<kLatencyBuckets.size()>& TtftHistogram() {
+  static Histogram<kLatencyBuckets.size()> histogram;
+  return histogram;
+}
+inline Histogram<kLatencyBuckets.size()>& RequestDurationHistogram() {
+  static Histogram<kLatencyBuckets.size()> histogram;
+  return histogram;
+}
+template<std::size_t N>
+inline void ObserveHistogram(Histogram<N>& histogram,
+                             const std::array<double, N>& bounds,
+                             double seconds) noexcept {
+  if (!(seconds >= 0.0))
+    seconds = 0.0;
+  for (std::size_t i = 0; i < N; ++i) {
+    if (seconds <= bounds[i])
+      histogram.cumulative[i].fetch_add(1, std::memory_order_relaxed);
+  }
+  histogram.count.fetch_add(1, std::memory_order_relaxed);
+  double current = histogram.sum.load(std::memory_order_relaxed);
+  while (!histogram.sum.compare_exchange_weak(current, current + seconds,
+                                              std::memory_order_relaxed)) {
+  }
+}
 }  // namespace detail
+
+/// Records one request that ended in an error or a lost device. The scheduler
+/// calls this from CompleteFailure, so a failed request is never counted as
+/// completed even when it had already produced tokens.
+inline void RecordFailedRequest() noexcept {
+  detail::TotalRequestsFailed().fetch_add(1, std::memory_order_relaxed);
+}
 
 inline double PrefillTokensPerSecond(
     const TextGenerationBackend::Result& result) {
@@ -145,6 +206,19 @@ inline void RecordRequestMetrics(const TextGenerationBackend::Result& result) {
                                         std::memory_order_relaxed)) {
     }
   };
+  if (result.cancelled) {
+    detail::TotalRequestsCancelled().fetch_add(1, std::memory_order_relaxed);
+  } else {
+    detail::TotalRequestsCompleted().fetch_add(1, std::memory_order_relaxed);
+    const double ttft_seconds = std::max(0.0, result.ttft_ms) / 1000.0;
+    const double duration_seconds =
+        (std::max(0.0, result.ttft_ms) + std::max(0.0, result.decode_ms)) /
+        1000.0;
+    detail::ObserveHistogram(detail::TtftHistogram(), detail::kLatencyBuckets,
+                             ttft_seconds);
+    detail::ObserveHistogram(detail::RequestDurationHistogram(),
+                             detail::kLatencyBuckets, duration_seconds);
+  }
   detail::TotalCachedPromptTokens().fetch_add(
       std::min(result.cached_prompt_tokens, result.prompt_tokens),
       std::memory_order_relaxed);

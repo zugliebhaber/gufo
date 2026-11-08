@@ -158,8 +158,10 @@ private:
 class Events final : public cache::RetentionEventSink {
 public:
   void Emit(const cache::RetentionEvent& e) noexcept override {
+    if (!Logger::Enabled(LogLevel::kDebug))
+      return;
     try {
-      Logger::Info(
+      Logger::Debug(
           "cache",
           "schema=component-cache-v1 event=retention action=" +
               std::to_string(static_cast<unsigned>(e.action)) +
@@ -1384,14 +1386,16 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                                                  : "no_checkpoint",
                              request.cached ? 0 : common,
                              request.cached ? request.cached : nearest};
-    Logger::Info("cache",
-                 "schema=component-cache-v1 event=acquire reuse=" +
-                     std::string(live               ? "live"
-                                 : request.disk_hit ? "disk"
-                                 : request.cached   ? "ram"
-                                                    : "none") +
-                     " selected_tokens=" + std::to_string(request.cached) +
-                     " restored_bytes=" + std::to_string(request.restored));
+    if (Logger::Enabled(LogLevel::kDebug)) {
+      Logger::Debug("cache",
+                    "schema=component-cache-v1 event=acquire reuse=" +
+                        std::string(live               ? "live"
+                                    : request.disk_hit ? "disk"
+                                    : request.cached   ? "ram"
+                                                       : "none") +
+                        " selected_tokens=" + std::to_string(request.cached) +
+                        " restored_bytes=" + std::to_string(request.restored));
+    }
     return lease;
   } catch (...) {
     if (lease)

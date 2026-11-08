@@ -101,6 +101,10 @@ struct TextSchedulerPolicy {
   /// disables it.
   std::chrono::milliseconds stall_timeout{0};
   bool log_progress{false};
+  /// Emit the vLLM-style periodic summary: a 10 s interval table and a
+  /// once-per-minute completed-request line. Every table row is a delta from
+  /// the previous row. The CLI enables it for serving.
+  bool log_stats{false};
   /// Starts the resident bound at one and grows it with queued demand while
   /// memory headroom allows. Memory-blocked requests are deferred
   /// indefinitely instead of being failed.

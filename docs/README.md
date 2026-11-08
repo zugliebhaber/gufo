@@ -12,6 +12,8 @@ page is the map of the detailed documentation.
 | understand the engine design | [Architecture](ARCHITECTURE.md), [KV cache](KV-CACHE.md) |
 | find a CLI command or setting | [CLI guide](CLI.md), [README settings](../README.md#commands-and-settings) |
 | call the HTTP API | [Server contract](SERVER.md) |
+| monitor with Prometheus | [Prometheus metrics](PROMETHEUS.md) |
+| build Grafana dashboards | [Grafana dashboard](GRAFANA.md) |
 | benchmark a model | [Benchmark methodology](BENCHMARKS.md), [performance loop](PERFORMANCE.md) |
 | understand the cache | [KV cache](KV-CACHE.md), [cache redesign RFC](cache-redesign/RFC.md) |
 | test or contribute | [Testing](TESTING.md), [CI](CI.md), [development](DEVELOPMENT.md) |
@@ -48,6 +50,10 @@ page is the map of the detailed documentation.
 - [Server limits](SERVER.md#lifecycle-and-limits), [authentication and
   exposure](SERVER.md#authentication-and-exposure), [troubleshooting
   logs](SERVER.md#troubleshooting-logs).
+- [Prometheus metrics](PROMETHEUS.md): scrape configuration, the complete
+  metric catalog, PromQL examples and alert rules.
+- [Grafana dashboard](GRAFANA.md): dashboard import, provisioning, panel
+  descriptions, customization and troubleshooting.
 - [Power/profile diagnostics](ARCHITECTURE.md#adr-7-diagnostics-and-power-profile-are-part-of-the-measurement-contract).
 
 ## Models

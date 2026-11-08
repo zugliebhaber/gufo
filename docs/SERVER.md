@@ -134,7 +134,9 @@ the pool at the widest execution plan: a wider pool serves additional sessions
 in later decode waves. The resolved count is logged at startup as
 `event=auto_sessions value=N policy=base-state-fit ... base_state_bytes=...
 state_capacity_bytes=... shared_kv_tokens=...` and repeated in
-`load_completed` as `sessions=auto(N)`. On this 128 GiB Strix Halo, Qwen3.8
+`load_completed` as `sessions=auto(N)`. `GUFO_AUTO_SESSIONS_MAX=N` caps the
+resolved count (default 256, or the memory fit when it is lower); the
+64-session deployment in this tree sets it to 64. On this 128 GiB Strix Halo, Qwen3.8
 Flash-Next resolves to **150 sessions at 128k** and **96 at 250k**, so the
 hybrid plan reaches 150 or 96 rows instead of the former 32-row control.
 
@@ -509,9 +511,9 @@ ceiling on one device, gufo or otherwise.
 Each server reads the queues already in use from
 `/sys/class/kfd/kfd/proc/*/queues/*/type`, which is world-readable and so
 includes processes gufo does not own, then exports `GPU_MAX_HW_QUEUES` before
-loading a model and logs a `queue_budget` event. That event is INFO-tier and
-follows `--log-level` like the rest of the startup diagnostics; the
-`queue_budget_exceeded` warning below is WARN-tier:
+loading a model and logs a `queue_budget` event. That event is DEBUG-tier, so
+the default INFO log stays quiet while `--log-level debug` records the plan;
+the `queue_budget_exceeded` warning below is WARN-tier:
 
 | Server | `GPU_MAX_HW_QUEUES` | Resident compute queues |
 | --- | ---: | ---: |
@@ -670,7 +672,7 @@ benchmarks](models/qwen3.8-flash-next/BENCHMARKS.md) and
 | `POST` | `/v1/completions` | Optional legacy text completion adapter |
 | `GET` | `/health` | Process liveness and GPU context (aliases: `/v1/health`, `/healthz`) |
 | `GET` | `/ready` | Model and backend readiness (aliases: `/v1/ready`, `/readyz`) |
-| `GET` | `/metrics` | Prometheus-format operational metrics (text LLM serving only) |
+| `GET` | `/metrics` | Prometheus-format operational metrics (alias `/v1/metrics`; text LLM serving only) |
 
 ### Other model services
 
@@ -1572,10 +1574,15 @@ a restart is the only recovery.
 
 ## Metrics
 
-`/metrics` exposes total prompt/generated tokens and the latest prompt/decode
-speeds. The token counters advance as each prefill chunk and generated token
-executes, so their rates show live throughput; prompt tokens exclude cache
-hits. `llamacpp:requests_processing` counts admitted requests, including cache
+`/metrics` (alias `/v1/metrics`) is a Prometheus text exposition endpoint with
+`Content-Type: text/plain; version=0.0.4; charset=utf-8`. See
+[Prometheus metrics](PROMETHEUS.md) for scrape configuration, the complete
+family catalog, PromQL and alert examples, and [Grafana dashboard](GRAFANA.md)
+for the importable dashboard and provisioning. It exposes total
+prompt/generated tokens and the latest prompt/decode speeds. The
+token counters advance as each prefill chunk and generated token executes, so
+their rates show live throughput; prompt tokens exclude cache hits.
+`llamacpp:requests_processing` counts admitted requests, including cache
 preparation and cleanup; `llamacpp:requests_deferred` counts requests waiting
 for a session. `llamacpp:preemptions_total` counts released model states and
 `llamacpp:recompute_tokens_total` the prompt and generated tokens their
@@ -1594,9 +1601,21 @@ prompt-lookup copies (`gufo_spec_lookup_tokens_total`,
 `gufo_spec_lookup_accepted_tokens_total`), and raises
 `llamacpp:n_tokens_max` to its prompt plus generated tokens. A request counts
 even if the client disconnects before reading it; requests that fail in the
-scheduler, such as on a deadline or a runner error, add none of these.
+scheduler, such as on a deadline or a runner error, add none of the token or
+cache counters but still increment `gufo_requests_total{status="failed"}`.
 `llamacpp:kv_cache_usage_ratio` is the in-flight prompt and generated tokens
 over sessions times context; retained cache entries are not counted.
+
+The Prometheus-native `gufo_*` families mirror those values and add request
+outcomes and latency. `gufo_requests_total{status="completed|cancelled|failed"}`
+counts finished text-generation requests exactly once; malformed HTTP requests
+rejected before generation are not counted. `gufo_ttft_seconds` and
+`gufo_request_duration_seconds` are fixed-bucket histograms over completed
+requests, from submission to first and last generated token.
+`gufo_sessions_capacity`, `gufo_sessions_active` and `gufo_context_tokens`
+describe the session pool, and `gufo_process_resident_memory_bytes` and
+`gufo_host_available_memory_bytes` report process and unified-memory headroom.
+The `llamacpp:*` families remain for llama.cpp-compatible tooling.
 `Server-Timing`, generation `timings`, and Chat Completions `usage.gufo`
 provide request-level measurements.
 
@@ -1640,16 +1659,31 @@ without `stream_options.include_usage`. `prompt_n` counts newly processed
 tokens; `cache_n` counts reused tokens. llama-swap uses these fields on every
 turn. Gufo-specific details stay in `usage.gufo`.
 
-TODO: retained-cache KV metrics, a validated administrative reload/drain
-interface, and in-process recovery after device reset or suspend/resume.
+TODO: retained-checkpoint block-pool gauges in `/metrics`, a validated
+administrative reload/drain interface, and in-process recovery after device
+reset or suspend/resume.
 
 ## Troubleshooting logs
 
 Server lifecycle and request logs go to stderr. Each request gets an
-`X-Request-ID` response header matching its `request=rN` log entries. Inference
-requests log receipt and completion; streaming completion is logged after the
-stream ends. Successful health/metrics and video-status polls are quiet at the
-default level.
+`X-Request-ID` response header matching its `request=rN` log entries. Successful
+health, metrics, model-list and video-status polls are quiet at the default
+level.
+
+Text inference no longer writes one INFO line per request. At INFO it emits a
+**10 s interval table** (`conc | pp/s req tg/s req TTFT ms | win pp/s win
+tg/s req/s win s fail cache`) and a **once-per-minute completed-request
+line** listing the request IDs with `ok`, `cancel` or `fail`. Every numeric
+table column is the difference between two consecutive snapshots: an idle row
+therefore reports zeros instead of the lifetime average. The `win` columns are
+the aggregate prompt and generated token throughput over that interval; `win s`
+is the interval duration; `fail` and `cache` count failures and prefix-cache
+hits in the interval. The table header is printed only after a minute request
+line, so the 10 s rows between minute boundaries carry data without repeating
+the header. Routine scheduler and cache detail stays at DEBUG: batch-limit
+changes, batched prefill widths, cache acquire/retention events and
+per-request receipt/completion lines. Errors still escalate to WARN/ERROR at
+every level.
 
 Set verbosity with `--log-level <error|warn|info|debug>` (default `info`);
 `-v`/`--verbose` is shorthand for `--log-level=debug` and cannot combine with
@@ -1675,6 +1709,9 @@ The `debug` tier adds:
   `event=options` as the sole record of what was asked for;
 - completion logs for the polls that are quiet by default, and `event=received`
   for GET requests;
+- routine GPU, scheduler and cache detail: the `event=queue_budget` plan,
+  `event=batch_limit`/`event=auto_batch_limit`, `event=batched_prefill`, and
+  cache `event=acquire`/`event=retention`;
 - scheduler decisions: `event=admitted` with the pending queue depth and the
   per-client depth the request joined, `event=admission_refused` naming the limit
   that rejected it and the client, and `event=backpressure` once per stream

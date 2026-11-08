@@ -229,6 +229,68 @@ the same 48-token matrix tile. All ungated 9-48-row batches now take the
 matrix kernel; only gated projections keep the eight-row cap, and the
 scheduler's 8k+1 hold-back keeps those on full tiles as well.
 
+## Why total throughput plateaus above a full wave
+
+The supplied 1-96 concurrency curve (README) is consistent with **two requests
+per concurrency slot and 128 generated tokens**: for concurrency >= 5,
+`tot_tg_tps * wall_s / 128` is the request count and equals `2 * conc`. The
+full-wave points are 32, 64 and 96 client concurrency:
+
+| conc | requests | wall s | tot TG tok/s | req/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 64 | 70.84 | 115.6 | 0.90 |
+| 64 | 128 | 105.81 | 154.8 | 1.21 |
+| 65 | 130 | 112.04 | 148.5 | 1.16 |
+| 96 | 192 | 157.55 | 156.0 | 1.22 |
+
+The 64 -> 96 step adds 50 % requests and 49 % wall time for +0.8 % total TG:
+the extra requests form another wave. The 64 -> 65 step adds two requests but
+6.2 s of wall and -4.1 % total TG. The marginal throughput makes the fixed wave
+cost visible:
+
+- 64 -> 65: +256 generated tokens for +6.23 s = **41 tok/s marginal**, far
+  below the 156 tok/s average; the third wave has started but is almost empty.
+- 65 -> 66: +256 tokens for +0.90 s = **284 tok/s marginal**; filling the new
+  wave is efficient again.
+
+Two quantizations align at 65:
+
+1. **Decode wave width.** The measured run's wave width is 64 requests/rows
+   (consistent with a 64-session pool or a 64-row plan): 128 requests are
+   exactly two full waves; 130 requests start a third wave that contains two
+   requests but still pays a full prefill and decode pass. The total TG of a
+   full wave is ~155-156 tok/s; a partial wave adds its fixed cost without its
+   full work.
+2. **Prefill cohort cap.** The cohort cap is 32. 128 requests are four full
+   cohorts; 130 are four cohorts plus two requests, so a fifth expert sweep is
+   paid for two requests. At 65 both boundaries move together, which is why the
+   dip is larger than at 33 or 49.
+
+The per-request rates fall as the wave is shared (`tg/s req` 29.9 -> 4.1), but
+the aggregate is already at the per-wave bandwidth ceiling: the decode step
+reads dense weights, routed experts, BF16 recurrent state and KV, and the
+prefill pass is serialized on the same stream. The decode profile measured
+~200 GB/s of the 240.76 GB/s gather ceiling in a c8 step; the prefill path is
+at ~58 GB/s and is kernel-efficiency-bound, not DRAM-bound. More waiting
+clients cannot add rows to a full wave; they only add waves and queue time.
+That is why `req/s` stays at ~1.2 and `tot pp/s` stays at ~445 while `wall s`
+grows.
+
+There are two layers to the answer: the **ceiling** is the per-wave memory
+bandwidth (~155-156 TG, ~445 PP in this run); the **staircase/dip** is the
+64-request decode wave and the 32-request prefill cohort. The 96 point is not a
+new ceiling: it is three full 64-request waves, which return to the same
+per-wave throughput while the wall grows.
+
+The fix is not more client concurrency; it is a **wider or faster wave**:
+raise the resident pool/plan to the 96/150/256 auto points, use the wide-decode
+kernels (#28, #25, #51, #52), and overlap prefill with decode. The current
+instance logs `batch_width=96` and `sessions=auto(96)`, so its decode wave is
+wider than the 64-request wave in this table; re-running the same load on it
+moves the decode knee to 96 requests (client concurrency 48 at two requests per
+slot). The per-wave ceiling remains, but a faster kernel raises the ceiling
+itself.
+
 ## Dynamic prefill cohort
 
 The scheduler derives the cohort from queue depth on every pass: cohort =
@@ -268,7 +330,8 @@ structural PP lever.
 Keep prompt count, context, output budget, sessions, cache mode, networking and
 power profile identical across A/B runs. Report wall time, aggregate PP/TG,
 p50/p95, HTTP status, pool high-water and the cohort events actually logged
-(`event=batched_prefill ... cohort=N`). A change is retained only when total TG
+(`event=batched_prefill ... cohort=N` at `--log-level debug`). A change is
+retained only when total TG
 at 1024 requests improves outside run noise **and** the deterministic output
 comparison against the serial path passes. Throughput without the quality
 check is not evidence.

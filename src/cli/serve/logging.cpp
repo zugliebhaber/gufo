@@ -162,11 +162,18 @@ void Logger::LogFormatted(LogLevel level, std::string_view component,
   Log(level, component, std::string_view(buffer, length));
 }
 
+std::size_t Logger::ResidentBytes() {
+  return ReadMemoryKiB("/proc/self/status", "VmRSS:") * 1024;
+}
+
+std::size_t Logger::HostAvailableBytes() {
+  return ReadMemoryKiB("/proc/meminfo", "MemAvailable:") * 1024;
+}
+
 std::string Logger::MemoryStatus() {
   std::ostringstream output;
-  output << "rss_mib=" << ReadMemoryKiB("/proc/self/status", "VmRSS:") / 1024
-         << " host_available_mib="
-         << ReadMemoryKiB("/proc/meminfo", "MemAvailable:") / 1024;
+  output << "rss_mib=" << ResidentBytes() / (1024 * 1024)
+         << " host_available_mib=" << HostAvailableBytes() / (1024 * 1024);
   return output.str();
 }
 

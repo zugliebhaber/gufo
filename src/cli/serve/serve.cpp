@@ -1005,8 +1005,8 @@ int RunServe(std::span<const char* const> args) {
         diagnostics::PlanQueues(profile, diagnostics::QueryQueueCensus(),
                                 std::getenv("GPU_MAX_HW_QUEUES"));
     diagnostics::ApplyQueuePlan(plan);
-    server::Logger::Info("gpu",
-                         diagnostics::DescribeQueuePlan(subcommand, plan));
+    server::Logger::Debug("gpu",
+                          diagnostics::DescribeQueuePlan(subcommand, plan));
     if (plan.may_exceed_budget) {
       server::Logger::Warn("gpu", diagnostics::DescribeQueuePressure(plan));
     }
@@ -1636,6 +1636,7 @@ int RunServe(std::span<const char* const> args) {
                     static_cast<std::chrono::milliseconds::rep>(
                         stall_timeout_ms)},
             .log_progress = log_progress,
+            .log_stats = true,
         },
         speculative_config,
         server::TextDiskCacheConfig{

@@ -91,6 +91,23 @@ std::uint32_t DecodePlanLimit() {
   return limit;
 }
 
+/// Upper bound for the auto-sized session pool. The fit still uses the
+/// measured base state; this only caps the resolved count for deployments
+/// that want a smaller resident pool than the memory fit allows.
+std::size_t AutoSessionCeiling() {
+  static const std::size_t ceiling = [] {
+    const char* text = std::getenv("GUFO_AUTO_SESSIONS_MAX");
+    if (text == nullptr || *text == '\0')
+      return std::size_t{256};
+    char* end = nullptr;
+    const auto parsed = std::strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || parsed < 1)
+      return std::size_t{256};
+    return std::min<std::size_t>(parsed, 4096);
+  }();
+  return ceiling;
+}
+
 struct QwenImageContext final : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
 };
@@ -3594,7 +3611,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                  "event=load_phase phase=sessions " + Logger::MemoryStatus());
     if (auto_sessions) {
       const auto claim = runner->ResourceClaim();
-      session_count = AutoSessionCount(*runner);
+      session_count = AutoSessionCount(*runner, AutoSessionCeiling());
       scheduler_policy.auto_sessions = true;
       Logger::Info(
           "loader",
@@ -3694,7 +3711,7 @@ bool InferenceBackend::load(
     }
     if (auto_sessions) {
       const auto claim = runner->ResourceClaim();
-      session_count = AutoSessionCount(*runner);
+      session_count = AutoSessionCount(*runner, AutoSessionCeiling());
       scheduler_policy.auto_sessions = true;
       Logger::Info(
           "loader",
@@ -3794,7 +3811,7 @@ bool InferenceBackend::load(
     }
     if (auto_sessions) {
       const auto claim = runner->ResourceClaim();
-      session_count = AutoSessionCount(*runner);
+      session_count = AutoSessionCount(*runner, AutoSessionCeiling());
       scheduler_policy.auto_sessions = true;
       Logger::Info(
           "loader",

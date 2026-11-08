@@ -1936,7 +1936,8 @@ void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
   runner->rows_per_chunk = 4096;
   constexpr std::size_t kRam = 448 << 10;
   const auto previous_level = Logger::Level();
-  Logger::SetLevel(LogLevel::kInfo);
+  // Retention events are routine cache detail; they live at the debug tier.
+  Logger::SetLevel(LogLevel::kDebug);
   std::ostringstream output;
   auto* previous_sink = std::clog.rdbuf(output.rdbuf());
   {

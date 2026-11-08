@@ -564,6 +564,33 @@ struct TextGenerationScheduler::Request::Impl {
   std::optional<GenerationTrace> trace;
 };
 
+struct CompletedStats {
+  std::uint64_t id{0};
+  std::size_t prompt_tokens{0};
+  std::size_t generated_tokens{0};
+  double ttft_ms{0.0};
+  bool failed{false};
+  bool cancelled{false};
+};
+
+/// Cumulative counters captured at the start of each statistics interval. The
+/// periodic table reports the difference between two snapshots, so every row
+/// describes the last ten seconds rather than the lifetime of the server.
+struct StatsSnapshot {
+  std::chrono::steady_clock::time_point time{};
+  std::uint64_t total_prompt_tokens{0};
+  std::uint64_t total_generated_tokens{0};
+  std::uint64_t completed{0};
+  std::uint64_t cancelled{0};
+  std::uint64_t failed{0};
+  std::uint64_t prompt_tokens{0};
+  std::uint64_t generated_tokens{0};
+  double prompt_seconds{0.0};
+  double gen_seconds{0.0};
+  double ttft_ms{0.0};
+  std::uint64_t cache_hits{0};
+};
+
 struct TextGenerationScheduler::Impl {
   Impl(std::shared_ptr<TextRunnerPool> model_runner_pool,
        TextPrefillPolicy model_prefill_policy,
@@ -652,6 +679,14 @@ struct TextGenerationScheduler::Impl {
                                 runner_pool->capacity());
     }
     PrepareStructuredOutput(runner_pool->runner());
+    stats_last.time = std::chrono::steady_clock::now();
+    stats_last.total_prompt_tokens = detail::TotalPromptTokens().load();
+    stats_last.total_generated_tokens = detail::TotalGenTokens().load();
+    stats_last.cache_hits = detail::PrefixCacheHits().load();
+    if (scheduler_policy.log_stats) {
+      stats_monitor = std::jthread(
+          [this](const std::stop_token& stop_token) { RunStats(stop_token); });
+    }
     worker = std::jthread(
         [this](const std::stop_token& stop_token) { Run(stop_token); });
     if (scheduler_policy.stall_timeout.count() > 0) {
@@ -662,6 +697,10 @@ struct TextGenerationScheduler::Impl {
   }
 
   ~Impl() {
+    stats_monitor.request_stop();
+    if (stats_monitor.joinable()) {
+      stats_monitor.join();
+    }
     stall_monitor.request_stop();
     if (stall_monitor.joinable()) {
       stall_monitor.join();
@@ -920,7 +959,10 @@ struct TextGenerationScheduler::Impl {
     if (queued == 0 && waiting.empty() && kv_deferred_requests.empty()) {
       if (resident == 0 && current != 1) {
         SetBatchLimit(1);
-        Logger::Info("scheduler", "event=auto_batch_limit value=1 reason=idle");
+        if (Logger::Enabled(LogLevel::kDebug)) {
+          Logger::Debug("scheduler",
+                        "event=auto_batch_limit value=1 reason=idle");
+        }
       }
       return;
     }
@@ -951,10 +993,12 @@ struct TextGenerationScheduler::Impl {
         resident + queued + waiting.size() + kv_deferred_requests.size();
     const std::size_t next = std::min(capacity, std::max(current + 1, demand));
     SetBatchLimit(next);
-    Logger::Info("scheduler",
-                 "event=auto_batch_limit value=" + std::to_string(next) +
-                     " queued=" + std::to_string(queued) +
-                     " estimate_tokens=" + std::to_string(estimate));
+    if (Logger::Enabled(LogLevel::kDebug)) {
+      Logger::Debug("scheduler",
+                    "event=auto_batch_limit value=" + std::to_string(next) +
+                        " queued=" + std::to_string(queued) +
+                        " estimate_tokens=" + std::to_string(estimate));
+    }
   }
 
   /// KV the runner claims for the whole session pool, in tokens.
@@ -1185,11 +1229,11 @@ struct TextGenerationScheduler::Impl {
     const std::size_t previous = batch_limit.exchange(value);
     if (previous == value)
       return;
-    if (Logger::Enabled(LogLevel::kInfo)) {
-      Logger::Info("scheduler",
-                   "event=batch_limit value=" + std::to_string(value) +
-                       " previous=" + std::to_string(previous) +
-                       " strategy=recompute");
+    if (Logger::Enabled(LogLevel::kDebug)) {
+      Logger::Debug("scheduler",
+                    "event=batch_limit value=" + std::to_string(value) +
+                        " previous=" + std::to_string(previous) +
+                        " strategy=recompute");
     }
     queue_condition.notify_all();
   }
@@ -1608,8 +1652,10 @@ struct TextGenerationScheduler::Impl {
       FinalizeResult(request, TextGenerationBackend::FinishReason::kCancelled);
       LogDecodeProgress(request, true);
       RecordRequestMetrics(request->result);
+      RecordCompletedStats(*request, false, true);
       PublishTerminal(request, {}, true);
     } catch (...) {
+      RecordFailedRequest();
       PublishTerminal(request, std::current_exception(), true);
     }
   }
@@ -1641,6 +1687,8 @@ struct TextGenerationScheduler::Impl {
     }
     request->result.completion_tokens = request->result.tokens.size();
     LogDecodeProgress(request, true);
+    RecordFailedRequest();
+    RecordCompletedStats(*request, true, false);
     PublishTerminal(request, std::move(failure), true);
   }
 
@@ -1810,7 +1858,211 @@ struct TextGenerationScheduler::Impl {
     // Recorded here rather than by the HTTP adapter, so a client that leaves
     // before reading the result still counts.
     RecordRequestMetrics(request->result);
+    RecordCompletedStats(*request, false, false);
     PublishTerminal(request);
+  }
+
+  /// Records one finished request for the periodic vLLM-style summary. The
+  /// scheduler calls this after its normal completion path, including
+  /// cancellations and failures; statistics are best effort.
+  void RecordCompletedStats(const ScheduledRequest& request, bool failed,
+                            bool cancelled) noexcept {
+    if (!scheduler_policy.log_stats)
+      return;
+    try {
+      const auto& result = request.result;
+      const std::size_t prompt = result.prefill_tokens;
+      const std::size_t generated = result.completion_tokens;
+      std::lock_guard<std::mutex> lock(stats_mutex);
+      stats_prompt_tokens += prompt;
+      stats_generated_tokens += generated;
+      stats_prompt_seconds += result.prefill_ms / 1000.0;
+      stats_gen_seconds += result.decode_ms / 1000.0;
+      stats_ttft_ms += result.ttft_ms;
+      if (failed)
+        ++stats_failed;
+      else if (cancelled)
+        ++stats_cancelled;
+      else
+        ++stats_completed;
+      stats_window.push_back(
+          {request.id, prompt, generated, result.ttft_ms, failed, cancelled});
+    } catch (...) {
+      // Periodic statistics must never fail a request.
+    }
+  }
+
+  /// Once-per-minute line naming the requests that finished in the window.
+  /// The window is swapped before the log-level check so a quiet level does
+  /// not accumulate an unbounded queue.
+  void LogCompletedWindow() {
+    std::deque<CompletedStats> window;
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex);
+      window.swap(stats_window);
+    }
+    if (!Logger::Enabled(LogLevel::kInfo))
+      return;
+    std::size_t failed = 0;
+    std::size_t cancelled = 0;
+    std::size_t prompt = 0;
+    std::size_t generated = 0;
+    for (const auto& entry : window) {
+      failed += entry.failed;
+      cancelled += entry.cancelled;
+      prompt += entry.prompt_tokens;
+      generated += entry.generated_tokens;
+    }
+    std::ostringstream out;
+    out << "event=requests window_s=60 completed=" << window.size()
+        << " failed=" << failed << " cancelled=" << cancelled
+        << " prompt_tokens=" << prompt << " generated_tokens=" << generated
+        << " ids=";
+    constexpr std::size_t kIdLimit = 24;
+    const auto append = [&out](const CompletedStats& entry) {
+      out << 'r' << entry.id;
+      if (entry.failed)
+        out << ":fail";
+      else if (entry.cancelled)
+        out << ":cancel";
+      else
+        out << ":ok";
+    };
+    if (window.empty()) {
+      out << "none";
+    } else {
+      const auto head =
+          window.size() <= kIdLimit ? window.size() : kIdLimit / 2;
+      for (std::size_t i = 0; i < head; ++i) {
+        if (i != 0)
+          out << ',';
+        append(window[i]);
+      }
+      if (window.size() > kIdLimit) {
+        out << ",+" << window.size() - kIdLimit << " more";
+        for (std::size_t i = window.size() - kIdLimit / 2; i < window.size();
+             ++i) {
+          out << ',';
+          append(window[i]);
+        }
+      }
+    }
+    Logger::Info("stats", out.str());
+  }
+
+  /// Ten-second interval over the whole text server. Every numeric column is
+  /// the difference between the previous snapshot and this one, so an idle
+  /// server reports zero instead of the lifetime average. Process-wide token
+  /// counters include in-flight work; per-request rates and TTFT come from
+  /// requests that completed in the interval.
+  void LogStats(bool header) {
+    StatsSnapshot current;
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex);
+      current.time = std::chrono::steady_clock::now();
+      current.total_prompt_tokens = detail::TotalPromptTokens().load();
+      current.total_generated_tokens = detail::TotalGenTokens().load();
+      current.completed = stats_completed;
+      current.cancelled = stats_cancelled;
+      current.failed = stats_failed;
+      current.prompt_tokens = stats_prompt_tokens;
+      current.generated_tokens = stats_generated_tokens;
+      current.prompt_seconds = stats_prompt_seconds;
+      current.gen_seconds = stats_gen_seconds;
+      current.ttft_ms = stats_ttft_ms;
+      current.cache_hits = detail::PrefixCacheHits().load();
+    }
+    const auto previous = stats_last;
+    stats_last = current;
+    if (!Logger::Enabled(LogLevel::kInfo))
+      return;
+
+    const auto delta = [](std::uint64_t now, std::uint64_t before) {
+      return now >= before ? now - before : 0;
+    };
+    const double interval =
+        std::chrono::duration<double>(current.time - previous.time).count();
+    const auto prompt_tokens =
+        delta(current.prompt_tokens, previous.prompt_tokens);
+    const auto generated_tokens =
+        delta(current.generated_tokens, previous.generated_tokens);
+    const auto completed = delta(current.completed, previous.completed);
+    const auto cancelled = delta(current.cancelled, previous.cancelled);
+    const auto failed = delta(current.failed, previous.failed);
+    const auto cache_hits = delta(current.cache_hits, previous.cache_hits);
+    const double prompt_seconds =
+        std::max(0.0, current.prompt_seconds - previous.prompt_seconds);
+    const double gen_seconds =
+        std::max(0.0, current.gen_seconds - previous.gen_seconds);
+    const double ttft_ms = std::max(0.0, current.ttft_ms - previous.ttft_ms);
+    const auto finished = completed + cancelled + failed;
+    const double pp_request =
+        prompt_seconds > 0.0
+            ? static_cast<double>(prompt_tokens) / prompt_seconds
+            : 0.0;
+    const double tg_request =
+        gen_seconds > 0.0 ? static_cast<double>(generated_tokens) / gen_seconds
+                          : 0.0;
+    const double ttft =
+        finished > 0 ? ttft_ms / static_cast<double>(finished) : 0.0;
+    const double total_pp =
+        interval > 0.0
+            ? static_cast<double>(delta(current.total_prompt_tokens,
+                                        previous.total_prompt_tokens)) /
+                  interval
+            : 0.0;
+    const double total_tg =
+        interval > 0.0
+            ? static_cast<double>(delta(current.total_generated_tokens,
+                                        previous.total_generated_tokens)) /
+                  interval
+            : 0.0;
+    const double request_rate =
+        interval > 0.0 ? static_cast<double>(finished) / interval : 0.0;
+    const auto concurrency = std::max<std::int64_t>(
+        0, detail::RequestsProcessing().load(std::memory_order_relaxed));
+    if (header) {
+      Logger::Info(
+          "stats",
+          "conc |  pp/s req  tg/s req  TTFT ms |  win pp/s  win tg/s   req/s  "
+          "win s  fail  cache");
+      Logger::Info("stats",
+                   "-----------------------------------------------------------"
+                   "---------------------------");
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1) << std::setw(4) << concurrency
+        << " | " << std::setw(9) << pp_request << std::setw(9) << tg_request
+        << std::setw(9) << std::setprecision(0) << ttft << " | " << std::setw(9)
+        << std::setprecision(1) << total_pp << std::setw(9) << total_tg
+        << std::setw(7) << std::setprecision(2) << request_rate << std::setw(7)
+        << interval << std::setw(5) << failed << std::setw(6) << cache_hits;
+    Logger::Info("stats", out.str());
+  }
+
+  /// One-second tick: 10 s interval statistics and a 60 s completed-request
+  /// window. The window log runs first and marks the header due, so the table
+  /// header appears only after the once-per-minute request line.
+  void RunStats(const std::stop_token& stop_token) noexcept {
+    using clock = std::chrono::steady_clock;
+    auto last_stats = clock::now();
+    auto last_window = last_stats;
+    while (!stop_token.stop_requested()) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (stop_token.stop_requested())
+        break;
+      const auto now = clock::now();
+      if (now - last_window >= std::chrono::seconds(60)) {
+        LogCompletedWindow();
+        stats_header_due = true;
+        last_window = now;
+      }
+      if (now - last_stats >= std::chrono::seconds(10)) {
+        LogStats(stats_header_due);
+        stats_header_due = false;
+        last_stats = now;
+      }
+    }
   }
 
   void ProcessQueuedCancellations() {
@@ -2342,11 +2594,11 @@ struct TextGenerationScheduler::Impl {
       record(request, step);
       for (std::size_t i = 0; i < peer_steps.size(); ++i)
         record(peers[i], peer_steps[i]);
-      if (!peers.empty() && Logger::Enabled(LogLevel::kInfo)) {
+      if (!peers.empty() && Logger::Enabled(LogLevel::kDebug)) {
         std::string tokens = std::to_string(step.consumed_tokens);
         for (const auto& peer_step : peer_steps)
           tokens += "+" + std::to_string(peer_step.consumed_tokens);
-        Logger::Info(
+        Logger::Debug(
             "scheduler",
             "event=batched_prefill request=" + std::to_string(request->id) +
                 " cohort=" + std::to_string(peers.size() + 1) +
@@ -3331,6 +3583,22 @@ struct TextGenerationScheduler::Impl {
   // completes makes no progress.
   std::atomic<std::uint64_t> progress{0};
   std::atomic<bool> loop_working{false};
+  // Periodic vLLM-style summary. The scheduler thread records finished
+  // requests; stats_monitor snapshots once per 10 s and once per minute.
+  mutable std::mutex stats_mutex;
+  std::deque<CompletedStats> stats_window;
+  std::uint64_t stats_prompt_tokens{0};
+  std::uint64_t stats_generated_tokens{0};
+  std::uint64_t stats_completed{0};
+  std::uint64_t stats_cancelled{0};
+  std::uint64_t stats_failed{0};
+  double stats_prompt_seconds{0.0};
+  double stats_gen_seconds{0.0};
+  double stats_ttft_ms{0.0};
+  /// Snapshot of the previous 10 s row. Only the statistics thread touches it.
+  StatsSnapshot stats_last{};
+  bool stats_header_due{false};
+  std::jthread stats_monitor;
   std::jthread worker;
   std::jthread stall_monitor;
 };
